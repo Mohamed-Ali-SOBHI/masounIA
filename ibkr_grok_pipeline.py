@@ -69,6 +69,16 @@ def main():
         default=os.getenv("IBKR_BUDGET_CURRENCY", "EUR"),
         help="Budget currency to select (default: EUR).",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Qualify orders via IBKR without placing them.",
+    )
+    parser.add_argument(
+        "--submit",
+        action="store_true",
+        help="Place orders in IBKR after Grok (implies --check).",
+    )
     args = parser.parse_args()
 
     temp_path = None
@@ -142,6 +152,32 @@ def main():
 
         write_json(parsed, args.out)
         print(f"Wrote {args.out}")
+        if args.check or args.submit:
+            place_cmd = [
+                sys.executable,
+                script_path("ibkr_place_orders.py"),
+                args.out,
+                "--host",
+                args.host,
+                "--port",
+                str(args.port),
+                "--client-id",
+                str(args.client_id),
+            ]
+            if args.account:
+                place_cmd.extend(["--account", args.account])
+            if args.submit:
+                place_cmd.append("--submit")
+            else:
+                place_cmd.append("--check")
+
+            place_result = run_command(place_cmd)
+            if place_result.stdout.strip():
+                print(place_result.stdout.strip())
+            if place_result.stderr.strip():
+                print(place_result.stderr.strip(), file=sys.stderr)
+            if place_result.returncode != 0:
+                return place_result.returncode or 2
         return 0
     finally:
         if temp_path and os.path.exists(temp_path):
