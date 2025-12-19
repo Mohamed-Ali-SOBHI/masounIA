@@ -1,0 +1,9 @@
+*.pyc
+__pycache__/
+.venv/
+venv/
+.env
+orders.json
+positions.json
+ibkr_positions_*.json
+.DS_Store
