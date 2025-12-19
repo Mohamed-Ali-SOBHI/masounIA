@@ -63,7 +63,7 @@ def main():
     parser.add_argument(
         "--client-id",
         type=int,
-        default=int(os.getenv("IBKR_CLIENT_ID", "2")),
+        default=int(os.getenv("IBKR_CLIENT_ID", "1")),
     )
     parser.add_argument("--account", default=os.getenv("IBKR_ACCOUNT"))
     parser.add_argument(
@@ -108,11 +108,6 @@ def main():
             ib.disconnect()
             return 2
 
-    if account:
-        ib.reqAccountUpdates(True, account)
-    else:
-        ib.reqAccountUpdates(True, "")
-
     summary = read_account_summary(ib, account)
     budget_entry = select_budget(summary, args.budget_tag, args.budget_currency)
     if not budget_entry or budget_entry["value"] is None:
@@ -120,13 +115,17 @@ def main():
             f"Budget not found for tag {args.budget_tag} currency {args.budget_currency}.",
             file=sys.stderr,
         )
-        ib.reqAccountUpdates(False, account or "")
         ib.disconnect()
         return 2
 
     ib.sleep(args.wait)
     portfolio_items = ib.portfolio()
-    ib.reqAccountUpdates(False, account or "")
+
+    if not portfolio_items:
+        print(
+            "Warning: Portfolio is empty. Increase --wait if you have positions.",
+            file=sys.stderr,
+        )
 
     positions = []
     for item in portfolio_items:

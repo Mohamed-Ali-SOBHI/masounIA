@@ -1,77 +1,114 @@
-# MasounIA - Grok + IBKR (explication simple)
+# MasounIA - Bot de Trading IA avec Grok
 
-Ce projet sert a:
-- lire ton portefeuille IBKR (positions + budget dispo),
-- demander a Grok une idee de trades long terme,
-- obtenir un JSON d'ordres exploitable par un script.
+Trading automatique base sur l'actualite en temps reel.
+Grok analyse les news (web + X) et place des ordres sur Interactive Brokers.
 
-Ce n'est pas un conseil financier. Utilise un compte paper avant tout passage en reel.
+**IMPORTANT**: Ce n'est PAS un conseil financier. Utilise un compte paper avant le reel.
 
-## Prerequis
-- Python 3.9+
-- TWS ou IB Gateway lance, API active
-- Cle API xAI (Grok)
+---
 
-Dependances:
-```
-pip install ib_insync
+## Utilisation Ultra-Simple
+
+### 1. Installation
+```bash
+pip install -r requirements.txt
 ```
 
-## Configuration rapide
-Dans `.env`, ajoute au minimum:
-```
-XAI_API_KEY=ta_cle_xai
+### 2. Configuration
+Copie `.env.example` vers `.env` et ajoute ta cle API xAI:
+```bash
+XAI_API_KEY=ta_cle_xai_ici
 ```
 
-Optionnel (si besoin):
+### 3. Lance TWS ou IB Gateway
+- Active l'API (Configuration > API > Enable ActiveX and Socket Clients)
+- DECOCHER "Read-Only API"
+- Port paper trading: 4002 (IB Gateway) ou 7497 (TWS)
+
+### 4. Lance le bot
+```bash
+python run.py
 ```
-IBKR_HOST=127.0.0.1
-IBKR_PORT=7497
-IBKR_CLIENT_ID=1
-IBKR_ACCOUNT=U1234567
+
+**C'est tout !** Le bot va:
+1. Recuperer ton portefeuille IBKR
+2. Analyser les news des dernieres 48-72h (web + X search avec raisonnement)
+3. Proposer des trades bases sur l'actualite
+4. Placer les ordres automatiquement
+
+---
+
+## Comment ca marche ?
+
+Le bot utilise **Grok 4.1 Fast Reasoning** (xAI) avec acces a:
+- **Web Search**: recherche en temps reel sur le web
+- **X Search**: analyse du sentiment sur X/Twitter
+- **Reasoning**: expose son raisonnement pour des decisions transparentes
+
+### Strategie
+- Scan des news majeures (earnings, Fed, geopolitique...)
+- Analyse du sentiment sur X
+- Identification de catalyseurs court/moyen terme
+- Verification croisee de multiples sources
+- Generation d'ordres avec justification
+- Raisonnement explicite pour chaque recommandation
+
+### Securite
+- Budget toujours depuis ton compte IBKR
+- Validation des ventes (ne peut pas vendre plus que detenu)
+- Ordres LIMIT avec buffer automatique
+- Limite de 3-5 positions maximum
+
+---
+
+## Configuration Avancee (optionnel)
+
+Dans `.env`, tu peux configurer:
+```bash
+IBKR_HOST=127.0.0.1          # Adresse IBKR
+IBKR_PORT=4002               # Port (4002=IB Gateway paper, 7497=TWS paper)
+IBKR_CLIENT_ID=1             # ID client unique
+IBKR_ACCOUNT=U1234567        # Numero de compte (auto-detecte si vide)
 IBKR_BUDGET_TAG=AvailableFunds
 IBKR_BUDGET_CURRENCY=EUR
+IBKR_LIMIT_BUFFER_BPS=25     # Buffer prix limite (25 basis points)
+IBKR_MD_WAIT=1.5             # Attente donnees marche (secondes)
 ```
 
-## Scripts (en bref)
-- `ibkr_export_positions.py`: exporte tes positions + budget dispo en JSON.
-- `grok41_fast_search.py`: appelle Grok et retourne un plan d'ordres en JSON.
-- `ibkr_place_orders.py`: lit le JSON et place (ou verifie) les ordres.
-- `ibkr_grok_pipeline.py`: enchaine export -> Grok -> `orders.json`.
+---
 
-## Utilisation simple (pipeline)
-```
-python ibkr_grok_pipeline.py "Propose des trades long terme" --out orders.json
-```
+## Fichiers generes
 
-Resultat:
-- `orders.json` contient un JSON structure (resume, points clefs, ordres).
+- `positions.json`: Export du portefeuille
+- `orders.json`: Ordres generes par Grok (avec sources et justifications)
 
-## Utilisation pas a pas
-1) Exporter les positions:
-```
+---
+
+## Scripts Internes (avance)
+
+Si tu veux plus de controle, tu peux utiliser les scripts individuellement:
+
+```bash
+# Exporter positions seulement
 python ibkr_export_positions.py --out positions.json
-```
 
-2) Appeler Grok avec tes positions:
-```
-python grok41_fast_search.py --positions positions.json "Propose des trades long terme"
-```
+# Analyser avec Grok seulement
+python grok41_fast_search.py --positions positions.json
 
-3) Verifier ou placer les ordres:
-```
+# Placer ordres seulement (sans soumettre)
 python ibkr_place_orders.py orders.json --check
-python ibkr_place_orders.py orders.json --submit
+
+# Pipeline complet avec options
+python ibkr_grok_pipeline.py --query "Focus secteur tech" --check
 ```
 
-## Budget
-Le budget est lu depuis IBKR via le tag `AvailableFunds` en EUR (par defaut).
-Tu peux changer via:
-```
---budget-tag --budget-currency
-```
+---
 
-## Conseils pratiques
-- Commence en paper trading.
-- Verifie chaque ordre (symbole, quantite, devise, type d'ordre).
-- Les ordres sont pensés long terme, pas pour du trading intraday.
+## Conseils de Securite
+
+1. **Commence en PAPER TRADING** (port 4002 pour IB Gateway, 7497 pour TWS)
+2. DECOCHER "Read-Only API" dans les parametres API
+3. Verifie toujours les ordres dans `orders.json` avant soumission
+4. Le budget est automatiquement limite a ce qui est disponible
+5. Les ordres sont des suggestions, pas des garanties
+6. Surveille les positions actives regulierement

@@ -7,4 +7,5 @@ venv/
 orders.json
 positions.json
 ibkr_positions_*.json
+audit/
 .DS_Store
