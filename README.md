@@ -30,11 +30,14 @@ XAI_API_KEY=ta_cle_xai_ici
 python run.py
 ```
 
-**C'est tout !** Le bot va:
+**C'est tout !** Le bot va tourner **en boucle toutes les heures** :
 1. Recuperer ton portefeuille IBKR
 2. Analyser les news des dernieres 48-72h (web + X search avec raisonnement)
 3. Proposer des trades bases sur l'actualite
 4. Placer les ordres automatiquement
+5. Attendre 1 heure et recommencer
+
+**Arreter le bot** : Appuie sur `Ctrl+C`
 
 ---
 
@@ -108,7 +111,9 @@ python ibkr_grok_pipeline.py --query "Focus secteur tech" --check
 
 1. **Commence en PAPER TRADING** (port 4002 pour IB Gateway, 7497 pour TWS)
 2. DECOCHER "Read-Only API" dans les parametres API
-3. Verifie toujours les ordres dans `orders.json` avant soumission
-4. Le budget est automatiquement limite a ce qui est disponible
-5. Les ordres sont des suggestions, pas des garanties
-6. Surveille les positions actives regulierement
+3. Le bot tourne en BOUCLE toutes les heures - surveille-le regulierement
+4. Verifie les fichiers `orders.json` generes pour comprendre les decisions
+5. Le budget est automatiquement limite a ce qui est disponible
+6. Les ordres sont des suggestions IA, pas des garanties
+7. Garde IB Gateway ouvert pendant que le bot tourne
+8. Utilise `Ctrl+C` pour arreter proprement le bot

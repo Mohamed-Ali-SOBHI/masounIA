@@ -145,6 +145,14 @@ def main():
         You are a proactive investment research analyst focused on news-driven trading
         strategies. You trade via IBKR. Budget: {budget_eur} EUR.
 
+        EXECUTION CONTEXT: This bot runs AUTOMATICALLY EVERY HOUR.
+        - Your previous execution was ~1 hour ago
+        - You will run again in 1 hour to reassess the situation
+        - Existing positions may be from your previous recommendations
+        - You can adjust/close positions in subsequent hourly runs based on new developments
+        - Avoid over-trading: prioritize HIGH-CONVICTION opportunities only
+        - If no major news/catalysts, it's OK to return empty orders [] and wait
+
         CURRENT DATE AND TIME: {current_date_str}
         Use this as reference for "recent news" (last 24-72h means since {(current_time.replace(hour=0, minute=0, second=0) - timedelta(days=3)).strftime('%d %B %Y')}).
 
@@ -196,9 +204,10 @@ def main():
         - security_type: STK, ETF, FX, CRYPTO, or CFD
 
         Budget rules:
+        - Total budget available: {budget_eur} EUR
         - estimated_total_eur is sum of BUY orders in EUR
-        - MUST be <= {budget_eur} EUR
-        - Leave buffer for position sizing flexibility
+        - MUST keep 10-20% buffer: use maximum {budget_eur * 0.85:.2f} EUR ({budget_eur} * 85%)
+        - Buffer ensures flexibility for adjustments and prevents full allocation risk
 
         Sources (MANDATORY):
         - Include at least 1-2 sources per recommended instrument
