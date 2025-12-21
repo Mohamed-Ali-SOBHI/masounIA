@@ -145,8 +145,16 @@ def build_contract(spec):
     exchange = spec.get("exchange")
     currency = spec.get("currency")
 
-    if sec_type in ("STK", "ETF"):
+    if sec_type == "STK":
         return Stock(symbol, exchange or "SMART", currency or "USD")
+    if sec_type == "ETF":
+        # ETFs need explicit Contract with secType="ETF"
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = "ETF"
+        contract.exchange = exchange or "SMART"
+        contract.currency = currency or "USD"
+        return contract
     if sec_type in ("CASH", "FX", "FOREX"):
         pair = normalize_forex_symbol(symbol)
         return Forex(pair)

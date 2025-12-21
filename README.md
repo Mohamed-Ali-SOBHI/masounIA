@@ -32,7 +32,7 @@ python run.py
 
 **C'est tout !** Le bot va tourner **en boucle toutes les heures** :
 1. Recuperer ton portefeuille IBKR
-2. Analyser les news des dernieres 48-72h (web + X search avec raisonnement)
+2. Analyser les news des dernieres 48-72h (web + X search autonome)
 3. Proposer des trades bases sur l'actualite
 4. Placer les ordres automatiquement
 5. Attendre 1 heure et recommencer
@@ -43,24 +43,31 @@ python run.py
 
 ## Comment ca marche ?
 
-Le bot utilise **Grok 4.1 Fast Reasoning** (xAI) avec acces a:
+Le bot utilise **Grok 4.1 Fast** (xAI) avec acces a:
 - **Web Search**: recherche en temps reel sur le web
 - **X Search**: analyse du sentiment sur X/Twitter
-- **Reasoning**: expose son raisonnement pour des decisions transparentes
+- **Agentic Tools**: execution autonome des recherches cote serveur
 
 ### Strategie
 - Scan des news majeures (earnings, Fed, geopolitique...)
 - Analyse du sentiment sur X
 - Identification de catalyseurs court/moyen terme
 - Verification croisee de multiples sources
-- Generation d'ordres avec justification
-- Raisonnement explicite pour chaque recommandation
+- Generation d'ordres avec justification detaillee
+- Recherches autonomes cote serveur (plus rapide)
 
 ### Securite
 - Budget toujours depuis ton compte IBKR
 - Validation des ventes (ne peut pas vendre plus que detenu)
 - Ordres LIMIT avec buffer automatique
 - Limite de 3-5 positions maximum
+
+### Restrictions geographiques (Compte IBKR europeen)
+- ETFs: Uniquement UCITS ETFs (domicilies en Europe)
+  * Listes sur: Euronext Amsterdam, Paris, Xetra, LSE
+  * JAMAIS d'ETFs US - non disponibles en Europe (regulation MiFID II)
+- Actions: Actions US accessibles (entreprises individuelles)
+- Format: Ticker seul sans suffixe d'exchange (.AS, .PA, .L, etc.)
 
 ---
 

@@ -70,7 +70,7 @@ def main():
         "--base-url", default="https://api.x.ai/v1", help="xAI API base URL."
     )
     parser.add_argument(
-        "--timeout", type=int, default=60, help="Request timeout in seconds."
+        "--timeout", type=int, default=3600, help="Request timeout in seconds (default: 3600s = 1h for reasoning models)."
     )
     parser.add_argument("--raw", action="store_true", help="Print Grok output.")
     parser.add_argument(
