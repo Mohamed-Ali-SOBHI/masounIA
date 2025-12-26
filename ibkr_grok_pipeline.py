@@ -194,6 +194,28 @@ def main():
             write_json(positions_data, os.path.join(audit_dir, "positions.json"))
             write_json(vars(args), os.path.join(audit_dir, "pipeline_args.json"))
 
+        # Vérifier si le compte utilise de la marge
+        if positions_data is None:
+            positions_data = read_json(positions_path)
+
+        if isinstance(positions_data, dict):
+            using_margin = positions_data.get("using_margin", False)
+            total_cash = positions_data.get("total_cash")
+
+            if using_margin or (total_cash is not None and total_cash < 0):
+                print("=" * 60, file=sys.stderr)
+                print("ALERTE MARGE - Cash negatif detecte", file=sys.stderr)
+                print("=" * 60, file=sys.stderr)
+                if total_cash is not None:
+                    print(f"Cash actuel: {total_cash:,.2f} EUR (NEGATIF!)", file=sys.stderr)
+                    print(f"Montant a recuperer: {abs(total_cash):,.2f} EUR", file=sys.stderr)
+                print("", file=sys.stderr)
+                print("Le bot va proposer des VENTES pour corriger la situation.", file=sys.stderr)
+                print("=" * 60, file=sys.stderr)
+                if audit_payload:
+                    audit_payload["margin_call_mode"] = True
+                    audit_payload["margin_amount"] = abs(total_cash) if total_cash else 0
+
         grok_cmd = [
             sys.executable,
             script_path("grok41_fast_search.py"),

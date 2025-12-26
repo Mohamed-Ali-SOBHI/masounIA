@@ -9,3 +9,4 @@ positions.json
 ibkr_positions_*.json
 audit/
 .DS_Store
+DEPLOY_RASPBERRY.md

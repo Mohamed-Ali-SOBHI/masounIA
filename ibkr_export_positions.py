@@ -20,6 +20,22 @@ def to_number(value):
     return num
 
 
+def calculate_pnl_percent(market_price, avg_cost):
+    """
+    Calculate percentage profit/loss.
+
+    Returns:
+        float or None: Percentage P&L, or None if cannot calculate
+    """
+    if market_price is None or avg_cost is None:
+        return None
+    if avg_cost == 0:
+        return None  # Division par zero
+
+    pnl_percent = ((market_price - avg_cost) / avg_cost) * 100
+    return round(pnl_percent, 2)  # Arrondi a 2 decimales
+
+
 def iso_utc_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -45,6 +61,14 @@ def select_budget(summary, tag, currency):
     for entry in summary:
         if entry["tag"] == tag and entry["currency"] == currency:
             return entry
+    return None
+
+
+def get_account_value(summary, tag, currency):
+    """Get a specific account value by tag and currency."""
+    for entry in summary:
+        if entry["tag"] == tag and entry["currency"] == currency:
+            return entry.get("value")
     return None
 
 
@@ -118,6 +142,23 @@ def main():
         ib.disconnect()
         return 2
 
+    # Récupérer les valeurs importantes du compte
+    currency = args.budget_currency
+    net_liquidation = get_account_value(summary, "NetLiquidation", currency)
+    total_cash = get_account_value(summary, "TotalCashValue", currency)
+    available_funds = budget_entry["value"]
+
+    # Alerter si le cash est négatif (situation de marge)
+    if total_cash is not None and total_cash < 0:
+        print(
+            f"WARNING: Vous utilisez de la marge! Cash: {total_cash:,.2f} {currency}",
+            file=sys.stderr,
+        )
+        print(
+            f"         Vous devez vendre ~{abs(total_cash):,.2f} {currency} de positions pour être cash-only.",
+            file=sys.stderr,
+        )
+
     ib.sleep(args.wait)
     portfolio_items = ib.portfolio()
 
@@ -128,10 +169,21 @@ def main():
         )
 
     positions = []
+    has_short_positions = False
     for item in portfolio_items:
         if account and item.account != account:
             continue
         contract = item.contract
+
+        # Calculer le pourcentage P&L
+        avg_cost = to_number(item.averageCost)
+        market_price = to_number(item.marketPrice)
+        pnl_percent = calculate_pnl_percent(market_price, avg_cost)
+
+        position_qty = to_number(item.position)
+        if position_qty is not None and position_qty < 0:
+            has_short_positions = True
+
         positions.append(
             {
                 "account": item.account,
@@ -141,21 +193,57 @@ def main():
                 "security_type": contract.secType,
                 "exchange": contract.exchange,
                 "currency": contract.currency,
-                "position": to_number(item.position),
-                "avg_cost": to_number(item.averageCost),
-                "market_price": to_number(item.marketPrice),
+                "position": position_qty,
+                "avg_cost": avg_cost,
+                "market_price": market_price,
                 "market_value": to_number(item.marketValue),
                 "unrealized_pnl": to_number(item.unrealizedPNL),
                 "realized_pnl": to_number(item.realizedPNL),
+                "pnl_percent": pnl_percent,
             }
         )
+
+    # Alerter si positions short détectées
+    if has_short_positions:
+        print(
+            f"WARNING: Positions SHORT detectees dans le portfolio!",
+            file=sys.stderr,
+        )
+        print(
+            f"         Le bot est configure LONG ONLY et sera bloque.",
+            file=sys.stderr,
+        )
+
+    # Calculer le budget safe (le plus conservateur entre TotalCash et AvailableFunds)
+    # Si TotalCash est négatif, on est en marge - budget = 0
+    # Sinon, on prend le minimum entre TotalCash et AvailableFunds
+    budget_safe = 0.0
+    if total_cash is not None and total_cash > 0:
+        if available_funds is not None and available_funds > 0:
+            budget_safe = min(total_cash, available_funds)
+        else:
+            budget_safe = total_cash
+    elif available_funds is not None and available_funds > 0:
+        # Cas où total_cash est négatif ou None mais AvailableFunds est positif
+        # On reste conservateur et on met budget à 0 si cash négatif
+        if total_cash is None or total_cash >= 0:
+            budget_safe = available_funds
+        else:
+            budget_safe = 0.0
 
     output = {
         "account": account or "",
         "as_of": iso_utc_now(),
-        "budget_eur": budget_entry["value"],
+        "net_liquidation": net_liquidation,  # NAV - Valeur totale du compte
+        "total_cash": total_cash,  # Cash disponible (peut être négatif si marge)
+        "available_funds": available_funds,  # Fonds disponibles pour trader
+        "budget_safe": budget_safe,  # Budget conservateur (min entre cash et available, 0 si marge)
+        "using_margin": (total_cash is not None and total_cash < 0) or has_short_positions,  # Flag pour marge ou short
+        "currency": currency,
+        # Ancien format pour compatibilité - utiliser budget_safe
+        "budget_eur": budget_safe,
         "budget_currency": budget_entry["currency"],
-        "budget_tag": budget_entry["tag"],
+        "budget_tag": "SafeBudget(min(TotalCash,AvailableFunds))",
         "positions": positions,
     }
 
