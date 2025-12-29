@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import textwrap
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from audit_memory import build_memory_section
 from ibkr_shared import load_dotenv, read_json, write_json
@@ -215,7 +215,6 @@ def main():
         return 2
 
     current_time = datetime.now(timezone.utc)
-    current_date_str = current_time.strftime("%A %d %B %Y, %H:%M UTC")
 
     # Detecter quels marches sont ouverts
     open_markets = get_open_markets(current_time)
@@ -245,6 +244,24 @@ def main():
         print("xai-sdk not installed. Run: pip install -r requirements.txt", file=sys.stderr)
         return 2
 
+    class CatalystTiming(BaseModel):
+        """Timing information for a catalyst event."""
+        model_config = ConfigDict(extra="forbid")
+        catalyst_description: str
+        catalyst_datetime: str  # ISO format: "2025-12-30T23:59:00Z"
+        time_to_catalyst_hours: float
+        entry_timing_rationale: str
+        timing_risk_level: str  # "low" | "medium" | "high"
+
+    class SourceWithCategory(BaseModel):
+        """Source with categorization for research quality tracking."""
+        model_config = ConfigDict(extra="forbid")
+        title: str
+        url: str
+        category: str  # "official" | "market_data" | "analyst" | "sentiment" | "macro"
+        relevance: str
+        publish_date: str | None = None  # ISO format or None
+
     class Order(BaseModel):
         model_config = ConfigDict(extra="forbid")
         symbol: str
@@ -262,7 +279,14 @@ def main():
         trailing_stop_percent: float | None = None
         rationale: str | None = None
 
+        # NEW FIELDS (optional for now - Semaine 1)
+        catalyst_timing: CatalystTiming | None = None
+        confidence_score: int | None = None
+        source_count: int | None = None
+        dedicated_sources: list[SourceWithCategory] | None = None
+
     class Source(BaseModel):
+        """Legacy source model (kept for backward compatibility)."""
         model_config = ConfigDict(extra="forbid")
         title: str
         url: str
@@ -274,8 +298,11 @@ def main():
         budget_eur: float
         estimated_total_eur: float
         orders: list[Order]
-        sources: list[Source]
+        sources: list[Source]  # Legacy, kept for backward compatibility
         disclaimer: str
+
+        # NEW FIELDS (optional for now - Semaine 1)
+        macro_sources: list[SourceWithCategory] | None = None
 
         @field_validator('estimated_total_eur')
         @classmethod
@@ -287,6 +314,42 @@ def main():
                     f"Reduce quantities or remove orders to stay within budget."
                 )
             return v
+
+        @field_validator('orders')
+        @classmethod
+        def validate_timing_and_confidence_warning(cls, orders):
+            """WARNING mode (Semaine 1): Log issues but don't fail validation."""
+            import sys
+
+            for order in orders:
+                # Skip validation if new fields are not populated (backward compatible)
+                if not order.catalyst_timing:
+                    continue
+
+                T = order.catalyst_timing.time_to_catalyst_hours
+                conf = order.confidence_score if order.confidence_score is not None else 0
+                src_count = order.source_count if order.source_count is not None else 0
+
+                # Timing validation (WARNING only)
+                if order.action == "BUY":
+                    # BUY: require T in [2h, 48h] (pre-catalyst entry)
+                    if T < 2 or T > 48:
+                        print(f"[WARNING] {order.symbol} BUY: time_to_catalyst={T:.1f}h outside [2h, 48h] window", file=sys.stderr)
+                elif order.action == "SELL":
+                    # SELL: allow negative T (post-catalyst exit) or immediate (<2h)
+                    if T > 48:
+                        print(f"[WARNING] {order.symbol} SELL: time_to_catalyst={T:.1f}h is >48h (why hold so long?)", file=sys.stderr)
+
+                # Confidence validation (WARNING only)
+                min_conf = 70 if 12 <= T <= 36 else 80
+                if conf < min_conf:
+                    print(f"[WARNING] {order.symbol}: confidence={conf} below minimum {min_conf}", file=sys.stderr)
+
+                # Source count validation (WARNING only)
+                if src_count < 7:
+                    print(f"[WARNING] {order.symbol}: source_count={src_count} below minimum 7", file=sys.stderr)
+
+            return orders
 
     schema_json = OrderPlan.model_json_schema()
 
@@ -322,99 +385,56 @@ def main():
     # Calculate budget limits
     budget_max = budget_eur * 0.80  # 80% pour sécurité
 
-    # Build system prompt
+    # Build NEW system prompt (refonte complete pour timing precis)
+    current_time_iso = current_time.isoformat()
+
     system_prompt = textwrap.dedent(
         f"""\
-        News-driven trading analyst. IBKR.
+        Event catalyst analyst. IBKR. Time: {current_time_iso}. {markets_context}
 
-        CONTEXT: Bot runs hourly. Previous run: ~1h ago. Next run: in 1h.
-        - Existing positions may be yours. Adjust/close based on new developments.
-        - High-conviction only. No major catalysts? Return empty orders [].
-        - {current_date_str}. Recent = last 24-72h ({(current_time.replace(hour=0, minute=0, second=0) - timedelta(days=3)).strftime('%d %b %Y')}-now).
-        - {markets_context}
-
-        ============================================================
-        *** CONTRAINTE BUDGETAIRE STRICTE (PRIORITE ABSOLUE) ***
-        ============================================================
-        Budget disponible: {budget_eur:.2f} EUR
-        MAXIMUM ABSOLU utilisable pour achats: {budget_max:.2f} EUR (80% du budget)
-
-        INTERDICTION TOTALE de proposer des ordres dont le total depasse {budget_max:.2f} EUR
-
-        CALCUL OBLIGATOIRE avant de proposer des ordres:
-        1. Pour chaque ordre BUY: cout = quantity × limit_price
-        2. Additionner TOUS les couts BUY → estimated_total_eur
-        3. Verifier: estimated_total_eur <= {budget_max:.2f} EUR
-        4. Si depassement: REDUIRE les quantites OU SUPPRIMER des ordres
-
-        VERIFICATION FINALE (avant de retourner le JSON):
-        - Calculer la somme totale de tous les ordres BUY
-        - Si somme > {budget_max:.2f} EUR → AJUSTER immediatement
-        - Ne JAMAIS retourner un plan qui depasse {budget_max:.2f} EUR
-        - Preferer MOINS d'ordres que de depasser le budget
-        - En cas de doute, rester sous {budget_eur * 0.70:.2f} EUR (70%)
-        ============================================================
-
+        CONTEXT: Bot runs hourly. High-conviction only. No catalysts? orders=[].
+        BUDGET: {budget_eur:.2f} EUR → Max {budget_max:.2f} EUR (80%). Sum(BUY × limit_price) ≤ max.
         {margin_status}
-
         {memory_context if memory_context else ""}
 
-        MANDATORY RESEARCH (web_search + x_search):
-        1. Scan 24-72h news: earnings, regulation, central banks, geopolitics, sector trends, M&A
-        2. X sentiment: market mood, analyst opinions, breaking news, retail shifts
-        3. Verify: 2-3 sources, check prices/volume, find catalysts (earnings dates, events)
-        4. Thesis: connect news to trades, spot over-reactions, sector rotations, contrarian plays
+        ═══ PROTOCOL (5 STAGES) ═══
 
-        STRATEGY:
-        - Base on RECENT news/trends. Cite specific events per order (rationale field).
-        - 2-5 day to monthly catalysts. Adapt to risk-on/off regime.
-        - Review current positions: SELL on negative news. Manage concentration.
-        - Avoid repetition: if a symbol was already bought in recent history, do not propose another BUY unless a new major catalyst appeared after the last run; otherwise return orders=[].
-        - Seek diversification across sectors and symbols. Avoid repetition: if a symbol was already bought in recent history, do not propose another buy unless a new major catalyst appeared after the last run (do not reuse the same catalyst). Otherwise orders=[].
-        - LONG ONLY: BUY to open, SELL to close existing positions. NO SHORT SELLING (action=SELL without position).
-        - BUY: max 3-5 liquid positions. LIMIT orders, current prices.
-          → RAPPEL BUDGET: Total de TOUS les BUY ne doit PAS depasser {budget_max:.2f} EUR
-          → Calculer le cout (quantity × limit_price) AVANT de proposer chaque ordre
-          → Ajuster les quantites si necessaire pour rester sous {budget_max:.2f} EUR
-        - time_in_force: DAY or GTC. exchange: ALWAYS use SMART (never NASDAQ/NYSE/etc).
-        - security_type: STK (stocks), ETF (etfs).
+        0️⃣ PORTFOLIO REVIEW (DO FIRST): Analyze ALL positions before new trades.
+        For each position: search last 12h developments → apply SELL matrix:
+        SELL if: ✗ Catalyst passed >24h no upside ✗ New negative catalyst ✗ Loss >15% ✗ Held >7d no catalyst ✗ No catalyst next 48h ✗ Gain >15%
+        HOLD if: ✓ Catalyst in 12-36h ✓ Gain 5-15% + catalyst pending ✓ Loss <10% + strong catalyst
+        → SELL orders need 7+ sources, confidence, timing (time_to_catalyst can be negative)
 
-        SELECTION DES ACTIONS SELON LES MARCHES OUVERTS:
-        - Consulter "{markets_context}" pour savoir quels marches sont ouverts
-        - Si US ouvert: Chercher catalyseurs recents sur marches americains
-        - Si US ferme mais Europe ouvert: Chercher catalyseurs recents sur marches europeens
-        - Si US ferme mais Asie ouvert: Chercher catalyseurs recents sur marches asiatiques
-        - Adapter la recherche de news aux regions des marches ouverts
-        - Si aucun marche ouvert: retourner orders=[] avec explication dans summary
+        1️⃣ MACRO: web_search Fed/ECB/geopolitics/VIX. 2-3 sources → macro_sources.
 
-        EUROPEAN IBKR RESTRICTIONS:
-        - ETFs: ONLY UCITS (European-domiciled). NO US ETFs.
-        - Stocks: All markets tradeable (no restrictions).
-        - Symbol: base ticker ONLY (NO exchange suffix). Exchange in separate field.
-        - Currency: match instrument domicile.
+        2️⃣ CATALYSTS (24-48h only): Scan earnings/FDA/M&A/partnerships.
+        Per instrument: 7-10+ sources (2-3 official, 2-3 market data, 1-2 analyst, 1-2 sentiment, 1 macro link).
 
-        SOURCES: 1-2 per instrument + macro context. Cite X posts if used. Insufficient data? orders=[].
+        3️⃣ TIMING: T = hours to catalyst. catalyst_datetime ISO required.
+        BUY if: T∈[2,12]h + conf≥80 | T∈(12,36)h + conf≥70 | T∈[36,48]h + conf≥80
+        REJECT: T<2h | T>48h | vague timing
 
-        OUTPUT (French, ASCII, strict JSON):
-        - summary: strategy + news drivers
-        - key_points: timeline, thesis, catalysts, risks, portfolio impact, sentiment, sources
-        - budget_eur: {budget_eur:.2f} (recopier exactement cette valeur)
-        - estimated_total_eur: SOMME EXACTE des (quantity × limit_price) pour TOUS les ordres BUY
-          → ATTENTION CRITIQUE: NE DOIT PAS DEPASSER {budget_max:.2f} EUR
-          → Si depassement: reduire quantites ou supprimer ordres AVANT de retourner le JSON
-          → Verifier le calcul: additionner tous les couts BUY
-        - orders: with rationale (news/catalyst)
-        - disclaimer: educational, not advice
-        - JSON only, match schema, no promises.
+        4️⃣ CONFIDENCE (0-100): Base: 7src=70, 10src=80. Bonus: optimal window +10, major FDA +10, volume spike +5. Penalty: biotech -5. Min 70.
 
-        VERIFICATION PRE-ENVOI OBLIGATOIRE:
-        Avant de retourner le JSON final, verifier une derniere fois:
-        → estimated_total_eur <= {budget_max:.2f} EUR ?
-        → Si NON: AJUSTER les ordres MAINTENANT (reduire quantites ou supprimer)
-        → Si OUI: OK, retourner le JSON
+        ═══ SELECTION ═══
 
-        JSON SCHEMA:
-        {json.dumps(schema_json, indent=2, ensure_ascii=True)}
+        NEW POSITIONS: Max 3-5 liquid (vol>500K/d), 2/sector, LONG only, LIMIT orders, DAY/GTC, SMART exchange.
+        NO REPEAT: Skip symbols bought last 3 runs unless NEW catalyst.
+        IBKR EU: ETFs=UCITS only (no SPY/QQQ). Stocks=all OK. Ticker=base only (no .AS/.PA). Currency=match domicile.
+
+        ═══ OUTPUT ═══
+
+        Each order: symbol, action (BUY/SELL), quantity, limit_price, currency, exchange, rationale.
+        catalyst_timing: {{catalyst_description, catalyst_datetime (ISO), time_to_catalyst_hours (BUY: +[2,48], SELL: can be -), entry_timing_rationale, timing_risk_level}}
+        confidence_score: 70-100. source_count: ≥7. dedicated_sources: [{{title, url, category, relevance, publish_date}}]
+
+        OrderPlan: summary (FR), key_points (FR), budget_eur={budget_eur:.2f}, estimated_total_eur, orders[], sources[], macro_sources[], disclaimer (FR).
+
+        ═══ QA CHECKLIST ═══
+        □ Analyzed ALL positions? □ SELL if Priority 1/2? □ Each order 7+ sources? □ Exact catalyst_datetime?
+        □ BUY: T∈[2,48]h? SELL: T justified? □ Confidence ≥70 (≥80 edge)? □ Total ≤ {budget_max:.2f}? □ No repeats?
+
+        Schema: {json.dumps(schema_json, indent=2, ensure_ascii=True)}
         """
     )
 
@@ -451,8 +471,23 @@ def main():
 
         try:
             parsed = OrderPlan.model_validate_json(content)
-        except Exception:
-            print(content)
+        except Exception as e:
+            print("=" * 80, file=sys.stderr)
+            print("VALIDATION ERROR: Grok response does not match schema", file=sys.stderr)
+            print("=" * 80, file=sys.stderr)
+
+            # Check if it's a Pydantic ValidationError
+            if hasattr(e, 'errors'):
+                print("\nValidation errors:", file=sys.stderr)
+                for error in e.errors():
+                    print(f"  - {error.get('loc')}: {error.get('msg')}", file=sys.stderr)
+            else:
+                print(f"\nError: {e}", file=sys.stderr)
+
+            print("\n" + "=" * 80, file=sys.stderr)
+            print("RAW GROK OUTPUT:", file=sys.stderr)
+            print("=" * 80, file=sys.stderr)
+            print(content, file=sys.stderr)
             return 1
 
         print(json.dumps(parsed.model_dump(), indent=2, ensure_ascii=True))

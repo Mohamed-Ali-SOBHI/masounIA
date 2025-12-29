@@ -10,6 +10,12 @@ import sys
 import time
 from datetime import datetime, timedelta
 
+# Charger les variables d'environnement
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ibkr_shared import load_dotenv
+
+load_dotenv(".env")
+
 
 def is_us_market_open(dt):
     """Verifie si les marches US (NYSE, NASDAQ) sont ouverts."""
@@ -220,6 +226,7 @@ def main():
     except KeyboardInterrupt:
         print("\n\nArret du bot demande par l'utilisateur (Ctrl+C)")
         print("Au revoir!")
+
         return 0
 
 

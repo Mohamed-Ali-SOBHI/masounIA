@@ -340,28 +340,17 @@ def main():
         limit_price = spec.get("limit_price")
         ref_price = None
 
-        # TOUJOURS appliquer le buffer pour les ordres LIMIT, même si Grok fournit un limit_price
-        if order_type in ("LMT", "LIMIT"):
+        if order_type in ("LMT", "LIMIT") and limit_price is None:
+            ref_price = get_reference_price(ib, qualified_contract, args.md_wait)
+            if ref_price is None:
+                print(f"Order {idx}: no market data for {spec['symbol']}", file=sys.stderr)
+                ib.disconnect()
+                return 2
             buffer = args.limit_buffer_bps / 10000.0
-
-            if limit_price is None:
-                # Cas 1: Grok n'a pas fourni de limit_price, on utilise le market price
-                ref_price = get_reference_price(ib, qualified_contract, args.md_wait)
-                if ref_price is None:
-                    print(f"Order {idx}: no market data for {spec['symbol']}", file=sys.stderr)
-                    ib.disconnect()
-                    return 2
-                if action == "BUY":
-                    limit_price = ref_price * (1 + buffer)
-                else:
-                    limit_price = ref_price * (1 - buffer)
+            if action == "BUY":
+                limit_price = ref_price * (1 + buffer)
             else:
-                # Cas 2: Grok a fourni un limit_price, on applique quand même le buffer
-                if action == "BUY":
-                    limit_price = limit_price * (1 + buffer)
-                else:
-                    limit_price = limit_price * (1 - buffer)
-
+                limit_price = ref_price * (1 - buffer)
             spec["limit_price"] = round(limit_price, 6)
 
         if action == "BUY":

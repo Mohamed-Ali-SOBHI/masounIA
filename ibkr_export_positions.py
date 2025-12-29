@@ -114,7 +114,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        from ib_insync import IB
+        from ib_insync import IB, Forex
     except Exception:
         print("Missing ib_insync. Install with: pip install ib_insync", file=sys.stderr)
         return 2
@@ -214,7 +214,70 @@ def main():
             file=sys.stderr,
         )
 
+    # Récupérer le taux de change EUR/USD implicite utilisé par IBKR
+    # en comparant les valeurs CashBalance en EUR et USD
+    fx_rate_usd_to_eur = None
+    cash_usd = get_account_value(summary, "CashBalance", "USD")
+    cash_eur_from_usd = get_account_value(summary, "CashBalance", "EUR")
+
+    # Si on a des valeurs EUR et USD, calculer le taux implicite
+    if cash_usd and cash_usd != 0 and cash_eur_from_usd and cash_eur_from_usd != 0:
+        # Le taux est approximé par la proportion des cash balances
+        # Note: Ceci est une approximation car CashBalance peut inclure plusieurs devises
+        fx_rate_usd_to_eur = cash_eur_from_usd / cash_usd if cash_usd != 0 else None
+
+    # Récupérer les ordres en attente (submitted mais pas filled)
+    open_trades = ib.openTrades()
+    pending_value_eur = 0.0
+    pending_value_by_currency = {}
+
+    for trade in open_trades:
+        order_status = trade.orderStatus.status
+        # Statuts considérés comme "en attente" (pas encore remplis)
+        pending_statuses = ['PreSubmitted', 'Submitted', 'PendingSubmit', 'PendingCancel']
+
+        if order_status in pending_statuses and trade.order.action == 'BUY':
+            # Calculer la valeur estimée de l'ordre en attente
+            quantity = trade.order.totalQuantity
+            contract = trade.contract
+
+            # Essayer d'obtenir le prix de l'ordre (limit price ou market price)
+            if hasattr(trade.order, 'lmtPrice') and trade.order.lmtPrice:
+                price = trade.order.lmtPrice
+            else:
+                # Si pas de limit price, récupérer le market price actuel
+                ib.qualifyContracts(contract)
+                ticker = ib.reqMktData(contract)
+                ib.sleep(1.0)
+                price = ticker.marketPrice() if ticker.marketPrice() else ticker.last
+                ib.cancelMktData(contract)
+
+            if price and price > 0:
+                order_value = quantity * price
+                order_currency = contract.currency
+
+                # Accumuler par devise
+                if order_currency not in pending_value_by_currency:
+                    pending_value_by_currency[order_currency] = 0.0
+                pending_value_by_currency[order_currency] += order_value
+
+    # Convertir les ordres en attente vers EUR
+    for order_currency, value in pending_value_by_currency.items():
+        if order_currency == currency:  # currency = EUR (budget_currency)
+            pending_value_eur += value
+        elif order_currency == 'USD' and fx_rate_usd_to_eur:
+            # Utiliser le taux implicite IBKR
+            pending_value_eur += value * fx_rate_usd_to_eur
+        elif order_currency == 'USD':
+            # Fallback: approximation standard si pas de taux disponible
+            pending_value_eur += value / 1.05
+        # Ajouter d'autres devises si nécessaire
+
+    if pending_value_eur > 0:
+        print(f"INFO: Ordres en attente detectes - Valeur totale: {pending_value_eur:.2f} EUR", file=sys.stderr)
+
     # Calculer le budget safe (le plus conservateur entre TotalCash et AvailableFunds)
+    # PUIS soustraire la valeur des ordres en attente
     # Si TotalCash est négatif, on est en marge - budget = 0
     # Sinon, on prend le minimum entre TotalCash et AvailableFunds
     budget_safe = 0.0
@@ -231,19 +294,26 @@ def main():
         else:
             budget_safe = 0.0
 
+    # Soustraire la valeur des ordres en attente du budget safe
+    budget_safe = max(0.0, budget_safe - pending_value_eur)
+
+    if pending_value_eur > 0:
+        print(f"INFO: Budget ajuste - Budget safe apres ordres en attente: {budget_safe:.2f} EUR", file=sys.stderr)
+
     output = {
         "account": account or "",
         "as_of": iso_utc_now(),
         "net_liquidation": net_liquidation,  # NAV - Valeur totale du compte
         "total_cash": total_cash,  # Cash disponible (peut être négatif si marge)
         "available_funds": available_funds,  # Fonds disponibles pour trader
-        "budget_safe": budget_safe,  # Budget conservateur (min entre cash et available, 0 si marge)
+        "pending_orders_value": pending_value_eur,  # Valeur des ordres en attente (EUR)
+        "budget_safe": budget_safe,  # Budget conservateur (min entre cash et available, 0 si marge) - MOINS ordres en attente
         "using_margin": (total_cash is not None and total_cash < 0) or has_short_positions,  # Flag pour marge ou short
         "currency": currency,
         # Ancien format pour compatibilité - utiliser budget_safe
         "budget_eur": budget_safe,
         "budget_currency": budget_entry["currency"],
-        "budget_tag": "SafeBudget(min(TotalCash,AvailableFunds))",
+        "budget_tag": "SafeBudget(min(TotalCash,AvailableFunds)-PendingOrders)",
         "positions": positions,
     }
 

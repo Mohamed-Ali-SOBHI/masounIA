@@ -8,6 +8,7 @@ import tempfile
 from datetime import datetime, timezone
 
 from ibkr_shared import load_dotenv, read_json, write_json
+from notifications import alert_execution_summary
 
 
 def script_path(name):
@@ -40,11 +41,15 @@ def record_cmd(audit_payload, name, result):
     }
 
 
-def record_error(audit_payload, message):
+def record_error(audit_payload, message, context=""):
     if audit_payload is None:
         return
     audit_payload["status"] = "error"
     audit_payload["error"] = message
+
+    # Email désactivé: les erreurs sont loggées dans audit/ uniquement
+    # Consulter audit/YYYYMMDD_HHMMSS/ pour voir les détails
+    # alert_error(message, message, context)
 
 
 def main():
@@ -212,6 +217,9 @@ def main():
                 print("", file=sys.stderr)
                 print("Le bot va proposer des VENTES pour corriger la situation.", file=sys.stderr)
                 print("=" * 60, file=sys.stderr)
+
+                # L'alerte margin call sera envoyée par alert_execution_summary (type CRITICAL)
+
                 if audit_payload:
                     audit_payload["margin_call_mode"] = True
                     audit_payload["margin_amount"] = abs(total_cash) if total_cash else 0
@@ -311,6 +319,11 @@ def main():
                 enriched_path = os.path.join(audit_dir, "orders_enriched.json")
                 if os.path.isfile(enriched_path):
                     audit_payload["orders_enriched"] = read_json(enriched_path)
+
+        # Envoyer notification de resume d'execution
+        orders_placed_count = len(parsed.get("orders", [])) if args.submit else None
+        alert_execution_summary(parsed, positions_data, orders_placed=orders_placed_count)
+
         if audit_payload is not None:
             audit_payload["status"] = "ok"
         return 0
