@@ -230,16 +230,18 @@ def main():
     open_trades = ib.openTrades()
     pending_value_eur = 0.0
     pending_value_by_currency = {}
+    pending_orders = []  # Liste détaillée des ordres pour Grok
 
     for trade in open_trades:
         order_status = trade.orderStatus.status
         # Statuts considérés comme "en attente" (pas encore remplis)
         pending_statuses = ['PreSubmitted', 'Submitted', 'PendingSubmit', 'PendingCancel']
 
-        if order_status in pending_statuses and trade.order.action == 'BUY':
+        if order_status in pending_statuses:
             # Calculer la valeur estimée de l'ordre en attente
             quantity = trade.order.totalQuantity
             contract = trade.contract
+            action = trade.order.action
 
             # Essayer d'obtenir le prix de l'ordre (limit price ou market price)
             if hasattr(trade.order, 'lmtPrice') and trade.order.lmtPrice:
@@ -252,7 +254,19 @@ def main():
                 price = ticker.marketPrice() if ticker.marketPrice() else ticker.last
                 ib.cancelMktData(contract)
 
-            if price and price > 0:
+            # Ajouter à la liste détaillée pour Grok
+            pending_orders.append({
+                "symbol": contract.symbol,
+                "action": action,
+                "quantity": int(quantity),
+                "status": order_status,
+                "limit_price": to_number(trade.order.lmtPrice) if hasattr(trade.order, 'lmtPrice') else None,
+                "order_type": trade.order.orderType,
+                "currency": contract.currency
+            })
+
+            # Calculer la valeur pour le budget (uniquement BUY)
+            if action == 'BUY' and price and price > 0:
                 order_value = quantity * price
                 order_currency = contract.currency
 
@@ -307,6 +321,7 @@ def main():
         "total_cash": total_cash,  # Cash disponible (peut être négatif si marge)
         "available_funds": available_funds,  # Fonds disponibles pour trader
         "pending_orders_value": pending_value_eur,  # Valeur des ordres en attente (EUR)
+        "pending_orders": pending_orders,  # Liste détaillée des ordres en attente pour Grok
         "budget_safe": budget_safe,  # Budget conservateur (min entre cash et available, 0 si marge) - MOINS ordres en attente
         "using_margin": (total_cash is not None and total_cash < 0) or has_short_positions,  # Flag pour marge ou short
         "currency": currency,

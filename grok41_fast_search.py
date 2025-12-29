@@ -134,6 +134,10 @@ def main():
     positions = read_json(args.positions)
     positions_json = json.dumps(positions, ensure_ascii=True)
 
+    # Extraire les ordres en attente pour éviter les positions SHORT accidentelles
+    pending_orders = positions.get("pending_orders", [])
+    pending_orders_json = json.dumps(pending_orders, ensure_ascii=True)
+
     # Vérifier si le compte utilise de la marge et détecter les positions short
     using_margin = False
     total_cash = None
@@ -405,6 +409,11 @@ def main():
         HOLD if: ✓ Catalyst in 12-36h ✓ Gain 5-15% + catalyst pending ✓ Loss <10% + strong catalyst
         → SELL orders need 7+ sources, confidence, timing (time_to_catalyst can be negative)
 
+        ⚠️ PENDING ORDERS: Check pending_orders list. If SELL pending for symbol X with qty N:
+        - Position has N shares → FORBIDDEN to SELL (would create SHORT)
+        - Position has >N shares → Can SELL max (position - N) shares
+        If BUY pending → Budget already reduced, ignore for position calc.
+
         1️⃣ MACRO: web_search Fed/ECB/geopolitics/VIX. 2-3 sources → macro_sources.
 
         2️⃣ CATALYSTS (24-48h only): Scan earnings/FDA/M&A/partnerships.
@@ -438,13 +447,18 @@ def main():
         """
     )
 
+    # Build messages list for dump
+    messages_list = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Positions IBKR (JSON): {positions_json}"},
+    ]
+    if pending_orders:
+        messages_list.append({"role": "user", "content": f"Pending Orders (JSON): {pending_orders_json}"})
+    messages_list.append({"role": "user", "content": args.query})
+
     messages_payload = {
         "model": args.model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Positions IBKR (JSON): {positions_json}"},
-            {"role": "user", "content": args.query},
-        ],
+        "messages": messages_list,
         "tools": ["web_search", "x_search"],
         "response_format": "pydantic:OrderPlan",
     }
@@ -459,6 +473,8 @@ def main():
         messages=[system(system_prompt)],
     )
     chat.append(user(f"Positions IBKR (JSON): {positions_json}"))
+    if pending_orders:
+        chat.append(user(f"Pending Orders (JSON): {pending_orders_json}"))
     chat.append(user(args.query))
 
     try:
