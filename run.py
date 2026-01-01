@@ -8,7 +8,8 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # Charger les variables d'environnement
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -17,15 +18,31 @@ from ibkr_shared import load_dotenv
 load_dotenv(".env")
 
 
+def _ensure_aware(dt):
+    """Force un datetime timezone-aware (UTC par défaut si naïf)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _within_session(dt_local, start_hour, start_minute, end_hour, end_minute):
+    """Vérifie que dt_local est dans la plage horaire [start, end]."""
+    start = dt_local.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    end = dt_local.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+    return start <= dt_local <= end
+
+
 def is_us_market_open(dt):
     """Verifie si les marches US (NYSE, NASDAQ) sont ouverts."""
+    dt_local = _ensure_aware(dt).astimezone(ZoneInfo("America/New_York"))
+
     # Week-end
-    if dt.weekday() >= 5:  # 5=samedi, 6=dimanche
+    if dt_local.weekday() >= 5:  # 5=samedi, 6=dimanche
         return False
 
-    year = dt.year
-    month = dt.month
-    day = dt.day
+    year = dt_local.year
+    month = dt_local.month
+    day = dt_local.day
 
     # Jours feries fixes
     fixed_holidays = [
@@ -38,12 +55,12 @@ def is_us_market_open(dt):
         return False
 
     # MLK Day - 3eme lundi de janvier
-    if month == 1 and dt.weekday() == 0:  # Lundi
+    if month == 1 and dt_local.weekday() == 0:  # Lundi
         if 15 <= day <= 21:
             return False
 
     # Presidents Day - 3eme lundi de fevrier
-    if month == 2 and dt.weekday() == 0:  # Lundi
+    if month == 2 and dt_local.weekday() == 0:  # Lundi
         if 15 <= day <= 21:
             return False
 
@@ -60,32 +77,35 @@ def is_us_market_open(dt):
         return False
 
     # Memorial Day - dernier lundi de mai
-    if month == 5 and dt.weekday() == 0:  # Lundi
+    if month == 5 and dt_local.weekday() == 0:  # Lundi
         if day >= 25:  # Dernier lundi est toujours >= 25
             return False
 
     # Labor Day - 1er lundi de septembre
-    if month == 9 and dt.weekday() == 0:  # Lundi
+    if month == 9 and dt_local.weekday() == 0:  # Lundi
         if day <= 7:  # Premier lundi est toujours <= 7
             return False
 
     # Thanksgiving - 4eme jeudi de novembre
-    if month == 11 and dt.weekday() == 3:  # Jeudi
+    if month == 11 and dt_local.weekday() == 3:  # Jeudi
         if 22 <= day <= 28:  # 4eme jeudi est toujours dans cette plage
             return False
 
-    return True
+    # Horaires réguliers: 09:30-16:00 America/New_York (hors pre/after-market)
+    return _within_session(dt_local, 9, 30, 16, 0)
 
 
 def is_europe_market_open(dt):
     """Verifie si les marches europeens (Euronext, Xetra, SIX) sont ouverts."""
+    dt_local = _ensure_aware(dt).astimezone(ZoneInfo("Europe/Paris"))
+
     # Week-end
-    if dt.weekday() >= 5:
+    if dt_local.weekday() >= 5:
         return False
 
-    year = dt.year
-    month = dt.month
-    day = dt.day
+    year = dt_local.year
+    month = dt_local.month
+    day = dt_local.day
 
     # Jours feries europeens communs
     # Note: LSE (Londres) a Boxing Day (26/12) mais Euronext/Xetra non
@@ -125,17 +145,21 @@ def is_europe_market_open(dt):
     if month == 5 and day == 1:
         return False
 
-    return True
+    # Horaires réguliers: 09:00-17:30 Europe/Paris
+    return _within_session(dt_local, 9, 0, 17, 30)
 
 
 def is_asia_market_open(dt):
     """Verifie si les marches asiatiques (Tokyo, Hong Kong) sont ouverts."""
-    # Week-end
-    if dt.weekday() >= 5:
+    dt_tokyo = _ensure_aware(dt).astimezone(ZoneInfo("Asia/Tokyo"))
+    dt_hk = dt_tokyo.astimezone(ZoneInfo("Asia/Hong_Kong"))
+
+    # Week-end (Tokyo ou HK)
+    if dt_tokyo.weekday() >= 5:
         return False
 
-    month = dt.month
-    day = dt.day
+    month = dt_tokyo.month
+    day = dt_tokyo.day
 
     # Jours feries communs (simplifie)
     # Note: Chaque marche a ses propres feries, ceci est une approximation
@@ -147,7 +171,12 @@ def is_asia_market_open(dt):
     if (month, day) in common_holidays:
         return False
 
-    return True
+    # Horaires approximatifs:
+    # - Tokyo: 09:00-15:00 JST (sans pause dejeuner pour simplifier)
+    # - Hong Kong: 09:30-16:00 HKT
+    tokyo_open = _within_session(dt_tokyo, 9, 0, 15, 0)
+    hk_open = _within_session(dt_hk, 9, 30, 16, 0)
+    return tokyo_open or hk_open
 
 
 def get_open_markets(dt):
@@ -183,7 +212,7 @@ def main():
 
     try:
         while True:
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
 
             # Verifie quels marches sont ouverts
             open_markets = get_open_markets(now)

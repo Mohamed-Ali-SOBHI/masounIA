@@ -39,6 +39,29 @@ def normalize_text(value):
     return text.upper()
 
 
+ALLOWED_SEC_TYPES = {"STK", "ETF"}
+ALLOWED_EXCHANGES = {"", "SMART"}
+ALLOWED_ORDER_TYPES = {"LMT", "LIMIT"}  # uniquement des ordres limit
+BANNED_US_ETF_TICKERS = {
+    # ETF US classiques à bloquer (non UCITS)
+    "SPY",
+    "QQQ",
+    "VOO",
+    "IWM",
+    "DIA",
+    "XLK",
+    "XLF",
+    "XLY",
+    "XLP",
+    "XLI",
+    "XLE",
+    "XLV",
+    "XLU",
+    "XLC",
+    "XLB",
+}
+
+
 def find_position(spec, positions):
     symbol = normalize_text(spec.get("symbol"))
     currency = normalize_text(spec.get("currency"))
@@ -64,7 +87,7 @@ def find_position(spec, positions):
     )
 
 
-def validate_sell_quantity(spec, positions):
+def validate_sell_quantity(spec, positions, pending_sells=None):
     if normalize_text(spec.get("action")) != "SELL":
         return
     if positions is None:
@@ -76,9 +99,27 @@ def validate_sell_quantity(spec, positions):
     if not is_valid_number(held) or float(held) <= 0:
         raise ValueError(f"No held quantity for {spec.get('symbol')}.")
     quantity = float(spec.get("quantity", 0))
+    # Retirer les ventes deja en attente pour eviter de passer en short
+    pending_qty = 0.0
+    if pending_sells is not None:
+        key = (
+            normalize_text(spec.get("symbol")),
+            normalize_text(spec.get("currency")),
+            normalize_text(spec.get("security_type") or "STK"),
+            normalize_text(spec.get("exchange")) or "SMART",
+        )
+        pending_qty = pending_sells.get(key, 0.0)
+    available = float(held) - float(pending_qty)
+    if available < 0:
+        available = 0
     if quantity > float(held) + 1e-9:
         raise ValueError(
             f"SELL quantity {quantity} exceeds held {held} for {spec.get('symbol')}."
+        )
+    if quantity > available + 1e-9:
+        raise ValueError(
+            f"SELL quantity {quantity} exceeds available after pending sells "
+            f"({available} <= held {held} - pending {pending_qty}) for {spec.get('symbol')}."
         )
 
 
@@ -137,6 +178,59 @@ def validate_order_spec(spec):
     if quantity <= 0:
         raise ValueError("Quantity must be > 0")
 
+    order_type = normalize_text(spec.get("order_type"))
+    if order_type not in ALLOWED_ORDER_TYPES:
+        allowed = ", ".join(sorted(ALLOWED_ORDER_TYPES))
+        raise ValueError(f"order_type {order_type or 'UNKNOWN'} not allowed. Use: {allowed}")
+
+
+def build_pending_sells_map(positions_data):
+    pending_sells = {}
+    if not isinstance(positions_data, dict):
+        return pending_sells
+    for order in positions_data.get("pending_orders", []) or []:
+        if normalize_text(order.get("action")) != "SELL":
+            continue
+        key = (
+            normalize_text(order.get("symbol")),
+            normalize_text(order.get("currency")),
+            normalize_text(order.get("security_type") or "STK"),
+            normalize_text(order.get("exchange")) or "SMART",
+        )
+        qty = order.get("quantity", 0) or 0
+        try:
+            qty = float(qty)
+        except (TypeError, ValueError):
+            continue
+        pending_sells[key] = pending_sells.get(key, 0.0) + qty
+    return pending_sells
+
+
+def validate_instrument(spec):
+    sec_type = str(spec.get("security_type") or "STK").upper()
+    if sec_type not in ALLOWED_SEC_TYPES:
+        raise ValueError(
+            f"security_type {sec_type} not allowed. Allowed: {', '.join(sorted(ALLOWED_SEC_TYPES))}"
+        )
+    exchange = normalize_text(spec.get("exchange"))
+    if exchange and exchange not in ALLOWED_EXCHANGES:
+        raise ValueError(
+            f"exchange {exchange} not allowed. Use SMART or leave empty for SMART routing."
+        )
+
+    # ETF: blocage explicite des tickers US non-UCITS
+    if sec_type == "ETF":
+        symbol = normalize_text(spec.get("symbol"))
+        # Liste blanche optionnelle via env (UCITS_ETF_WHITELIST=VEUR,CSND,...)
+        whitelist_env = os.getenv("UCITS_ETF_WHITELIST", "")
+        whitelist = {s.strip().upper() for s in whitelist_env.split(",") if s.strip()}
+        if whitelist and symbol not in whitelist:
+            raise ValueError(
+                f"ETF {symbol} not in UCITS whitelist (env UCITS_ETF_WHITELIST). Add it explicitly to proceed."
+            )
+        if symbol in BANNED_US_ETF_TICKERS:
+            raise ValueError(f"ETF {symbol} is blocked (US ETF, non-UCITS).")
+
 
 def build_contract(spec):
     from ib_insync import CFD, Contract, Crypto, Forex, Stock
@@ -146,31 +240,29 @@ def build_contract(spec):
     exchange = spec.get("exchange")
     currency = spec.get("currency")
 
+    # Enforce whitelist for instruments/exchange
+    validate_instrument(spec)
+
+    safe_exchange = exchange or "SMART"
+    safe_currency = currency or "USD"
+
     if sec_type == "STK":
-        return Stock(symbol, exchange or "SMART", currency or "USD")
+        return Stock(symbol, safe_exchange, safe_currency)
     if sec_type == "ETF":
         # ETFs need explicit Contract with secType="ETF"
         contract = Contract()
         contract.symbol = symbol
         contract.secType = "ETF"
-        contract.exchange = exchange or "SMART"
-        contract.currency = currency or "USD"
+        contract.exchange = safe_exchange
+        contract.currency = safe_currency
         return contract
-    if sec_type in ("CASH", "FX", "FOREX"):
-        pair = normalize_forex_symbol(symbol)
-        return Forex(pair)
-    if sec_type in ("CRYPTO", "CRYPT"):
-        return Crypto(symbol, exchange, currency or "USD")
-    if sec_type == "CFD":
-        return CFD(symbol, exchange or "SMART", currency or "USD")
 
+    # Should not reach here due to whitelist, keep fallback defensive
     contract = Contract()
     contract.symbol = symbol
     contract.secType = sec_type
-    if exchange:
-        contract.exchange = exchange
-    if currency:
-        contract.currency = currency
+    contract.exchange = safe_exchange
+    contract.currency = safe_currency
     return contract
 
 
@@ -265,10 +357,12 @@ def main():
     positions_data = None
     positions_list = None
     budget_eur = args.budget_eur
+    pending_sells_map = {}
     if args.positions:
         positions_data = read_json(args.positions)
         if isinstance(positions_data, dict):
             positions_list = positions_data.get("positions")
+            pending_sells_map = build_pending_sells_map(positions_data)
             if budget_eur is None and is_valid_number(positions_data.get("budget_eur")):
                 budget_eur = float(positions_data.get("budget_eur"))
         if not isinstance(positions_list, list):
@@ -284,12 +378,17 @@ def main():
 
     for spec in orders:
         validate_order_spec(spec)
+        try:
+            validate_instrument(spec)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         if normalize_text(spec.get("action")) == "SELL" and positions_list is None:
             print("SELL orders require --positions for validation.", file=sys.stderr)
             return 2
         if positions_list is not None:
             try:
-                validate_sell_quantity(spec, positions_list)
+                validate_sell_quantity(spec, positions_list, pending_sells_map)
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 return 2
@@ -379,11 +478,15 @@ def main():
         qualified_orders.append((idx, spec, qualified_contract))
 
     if budget_eur is not None:
-        data["budget_eur"] = float(budget_eur)
+        budget_eur = float(budget_eur)
+        budget_cap = budget_eur * 0.80
+        data["budget_eur"] = budget_eur
         data["estimated_total_eur"] = round(total_buy_eur, 2)
-        if total_buy_eur > float(budget_eur) + 0.01:
+        data["budget_cap_eur"] = round(budget_cap, 2)
+        if total_buy_eur > budget_cap + 0.01:
             print(
-                f"Total BUY {total_buy_eur:.2f} EUR exceeds budget {budget_eur:.2f} EUR.",
+                f"Total BUY {total_buy_eur:.2f} EUR exceeds 80% budget cap {budget_cap:.2f} EUR "
+                f"(budget {budget_eur:.2f} EUR).",
                 file=sys.stderr,
             )
             ib.disconnect()

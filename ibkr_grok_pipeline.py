@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 
 from ibkr_shared import load_dotenv, read_json, write_json
 from notifications import alert_execution_summary
+from grok41_fast_search import (
+    is_us_market_open,
+    is_europe_market_open,
+    is_asia_market_open,
+)
 
 
 def script_path(name):
@@ -50,6 +55,17 @@ def record_error(audit_payload, message, context=""):
     # Email désactivé: les erreurs sont loggées dans audit/ uniquement
     # Consulter audit/YYYYMMDD_HHMMSS/ pour voir les détails
     # alert_error(message, message, context)
+
+
+def get_open_markets(dt):
+    markets = []
+    if is_us_market_open(dt):
+        markets.append("US")
+    if is_europe_market_open(dt):
+        markets.append("Europe")
+    if is_asia_market_open(dt):
+        markets.append("Asia")
+    return markets
 
 
 def main():
@@ -152,6 +168,20 @@ def main():
             "args": vars(args),
             "status": "running",
         }
+
+    # Bloquer execution si tous les marches sont fermes (fail-safe)
+    now = datetime.now(timezone.utc)
+    open_markets = get_open_markets(now)
+    if audit_payload is not None:
+        audit_payload["markets_open"] = open_markets
+        audit_payload["checked_markets_at"] = now.isoformat()
+    if not open_markets:
+        msg = "Tous les marches sont fermes (week-end ou jour ferie) - pipeline arrete."
+        print(msg)
+        if audit_payload is not None:
+            audit_payload["status"] = "skipped_markets_closed"
+            audit_payload["reason"] = msg
+        return 0
 
     temp_path = None
     positions_path = args.positions_out

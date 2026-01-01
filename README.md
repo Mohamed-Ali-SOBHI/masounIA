@@ -35,9 +35,10 @@ Chaque trade est accompagné de sa justification complète: sources, analyse, sc
 ### Sécurité
 - Budget limité automatiquement à 80% du cash disponible
 - Protection anti-SHORT intégrée
-- Ordres LIMIT uniquement (pas de market orders)
+- Ordres LIMIT uniquement (pas de market orders) — contrôle côté code: tout autre `order_type` est rejeté
 - Maximum 3-5 positions simultanées
 - Validation des ventes (ne peut jamais vendre plus que détenu)
+- ETF UCITS uniquement: les ETF US courants (SPY/QQQ/VOO/IWM...) sont bloqués. Option de whitelist via `UCITS_ETF_WHITELIST=VEUR,CSND,...` dans `.env`.
 
 ---
 

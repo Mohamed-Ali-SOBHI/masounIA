@@ -5,9 +5,27 @@ import os
 import sys
 import textwrap
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from audit_memory import build_memory_section
 from ibkr_shared import load_dotenv, read_json, write_json
+
+# Instruments autorisés pour la génération d'ordres (cohérent avec l'exécution IBKR)
+ALLOWED_SEC_TYPES = ["STK", "ETF"]
+
+
+def _ensure_aware(dt):
+    """Force un datetime timezone-aware (UTC par défaut si naïf)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _within_session(dt_local, start_hour, start_minute, end_hour, end_minute):
+    """Vérifie que dt_local est dans la plage horaire [start, end]."""
+    start = dt_local.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    end = dt_local.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+    return start <= dt_local <= end
 
 
 def extract_budget_eur(positions):
@@ -21,33 +39,36 @@ def extract_budget_eur(positions):
 
 def is_us_market_open(dt):
     """Verifie si les marches US (NYSE, NASDAQ) sont ouverts."""
-    if dt.weekday() >= 5:
+    dt_local = _ensure_aware(dt).astimezone(ZoneInfo("America/New_York"))
+    if dt_local.weekday() >= 5:
         return False
-    year, month, day = dt.year, dt.month, dt.day
+    year, month, day = dt_local.year, dt_local.month, dt_local.day
     fixed_holidays = [(1, 1), (7, 4), (12, 25)]
     if (month, day) in fixed_holidays:
         return False
-    if month == 1 and dt.weekday() == 0 and 15 <= day <= 21:
+    if month == 1 and dt_local.weekday() == 0 and 15 <= day <= 21:
         return False
-    if month == 2 and dt.weekday() == 0 and 15 <= day <= 21:
+    if month == 2 and dt_local.weekday() == 0 and 15 <= day <= 21:
         return False
     good_fridays = {2025: (4, 18), 2026: (4, 3), 2027: (3, 26), 2028: (4, 14), 2029: (3, 30), 2030: (4, 19)}
     if year in good_fridays and (month, day) == good_fridays[year]:
         return False
-    if month == 5 and dt.weekday() == 0 and day >= 25:
+    if month == 5 and dt_local.weekday() == 0 and day >= 25:
         return False
-    if month == 9 and dt.weekday() == 0 and day <= 7:
+    if month == 9 and dt_local.weekday() == 0 and day <= 7:
         return False
-    if month == 11 and dt.weekday() == 3 and 22 <= day <= 28:
+    if month == 11 and dt_local.weekday() == 3 and 22 <= day <= 28:
         return False
-    return True
+    # Horaires réguliers: 09:30-16:00 America/New_York
+    return _within_session(dt_local, 9, 30, 16, 0)
 
 
 def is_europe_market_open(dt):
     """Verifie si les marches europeens (Euronext, Xetra, SIX) sont ouverts."""
-    if dt.weekday() >= 5:
+    dt_local = _ensure_aware(dt).astimezone(ZoneInfo("Europe/Paris"))
+    if dt_local.weekday() >= 5:
         return False
-    year, month, day = dt.year, dt.month, dt.day
+    year, month, day = dt_local.year, dt_local.month, dt_local.day
     common_holidays = [(1, 1), (12, 25)]
     if (month, day) in common_holidays:
         return False
@@ -59,18 +80,27 @@ def is_europe_market_open(dt):
         return False
     if month == 5 and day == 1:
         return False
-    return True
+    # Horaires réguliers: 09:00-17:30 Europe/Paris
+    return _within_session(dt_local, 9, 0, 17, 30)
 
 
 def is_asia_market_open(dt):
     """Verifie si les marches asiatiques (Tokyo, Hong Kong) sont ouverts."""
-    if dt.weekday() >= 5:
+    dt_tokyo = _ensure_aware(dt).astimezone(ZoneInfo("Asia/Tokyo"))
+    dt_hk = dt_tokyo.astimezone(ZoneInfo("Asia/Hong_Kong"))
+
+    if dt_tokyo.weekday() >= 5:
         return False
-    month, day = dt.month, dt.day
+    month, day = dt_tokyo.month, dt_tokyo.day
     common_holidays = [(1, 1), (12, 25)]
     if (month, day) in common_holidays:
         return False
-    return True
+    # Horaires approximatifs:
+    # - Tokyo: 09:00-15:00 JST
+    # - Hong Kong: 09:30-16:00 HKT
+    tokyo_open = _within_session(dt_tokyo, 9, 0, 15, 0)
+    hk_open = _within_session(dt_hk, 9, 30, 16, 0)
+    return tokyo_open or hk_open
 
 
 def get_open_markets(dt):
@@ -288,6 +318,7 @@ def main():
         confidence_score: int | None = None
         source_count: int | None = None
         dedicated_sources: list[SourceWithCategory] | None = None
+        warnings: list[str] | None = None  # Liste des écarts aux règles (si non bloquant)
 
     class Source(BaseModel):
         """Legacy source model (kept for backward compatibility)."""
@@ -397,51 +428,53 @@ def main():
         Event catalyst analyst. IBKR. Time: {current_time_iso}. {markets_context}
 
         CONTEXT: Bot runs hourly. High-conviction only. No catalysts? orders=[].
-        BUDGET: {budget_eur:.2f} EUR → Max {budget_max:.2f} EUR (80%). Sum(BUY × limit_price) ≤ max.
+        BUDGET: {budget_eur:.2f} EUR | Max {budget_max:.2f} EUR (80%). Sum(BUY * limit_price) <= max.
         {margin_status}
         {memory_context if memory_context else ""}
 
-        ═══ PROTOCOL (5 STAGES) ═══
+        ==== PROTOCOL (5 STAGES) ====
 
-        0️⃣ PORTFOLIO REVIEW (DO FIRST): Analyze ALL positions before new trades.
-        For each position: search last 12h developments → apply SELL matrix:
-        SELL if: ✗ Catalyst passed >24h no upside ✗ New negative catalyst ✗ Loss >15% ✗ Held >7d no catalyst ✗ No catalyst next 48h ✗ Gain >15%
-        HOLD if: ✓ Catalyst in 12-36h ✓ Gain 5-15% + catalyst pending ✓ Loss <10% + strong catalyst
-        → SELL orders need 7+ sources, confidence, timing (time_to_catalyst can be negative)
+        0) PORTFOLIO REVIEW (DO FIRST): Analyze ALL positions before new trades.
+        SELL if: catalyst passed >24h no upside | new negative catalyst | loss >15% | held >7d no catalyst | no catalyst next 48h | gain >15%
+        HOLD if: catalyst in 12-36h | gain 5-15% + catalyst pending | loss <10% + strong catalyst
+        SELL orders need 7+ sources, confidence, timing (time_to_catalyst can be negative).
 
-        ⚠️ PENDING ORDERS: Check pending_orders list. If SELL pending for symbol X with qty N:
-        - Position has N shares → FORBIDDEN to SELL (would create SHORT)
-        - Position has >N shares → Can SELL max (position - N) shares
-        If BUY pending → Budget already reduced, ignore for position calc.
+        PENDING ORDERS: If SELL pending for symbol X qty=N:
+        - Position has N shares -> FORBIDDEN to SELL (would short)
+        - Position has >N shares -> Can SELL max (position - N)
+        If BUY pending -> budget already reduced, ignore for position calc.
 
-        1️⃣ MACRO: web_search Fed/ECB/geopolitics/VIX. 2-3 sources → macro_sources.
+        1) MACRO: web_search Fed/ECB/geopolitics/VIX. 2-3 sources -> macro_sources.
 
-        2️⃣ CATALYSTS (24-48h only): Scan earnings/FDA/M&A/partnerships.
-        Per instrument: 7-10+ sources (2-3 official, 2-3 market data, 1-2 analyst, 1-2 sentiment, 1 macro link).
+        2) CATALYSTS (24-48h only): earnings/FDA/M&A/partnerships. Per instrument 7-10+ sources (2-3 official, 2-3 market data, 1-2 analyst, 1-2 sentiment, 1 macro).
 
-        3️⃣ TIMING: T = hours to catalyst. catalyst_datetime ISO required.
-        BUY if: T∈[2,12]h + conf≥80 | T∈(12,36)h + conf≥70 | T∈[36,48]h + conf≥80
-        REJECT: T<2h | T>48h | vague timing
+        3) TIMING: T = hours to catalyst. catalyst_datetime ISO required.
+        BUY: T in [2,12]h conf>=80 | T in (12,36)h conf>=70 | T in [36,48]h conf>=80. REJECT T<2h or T>48h.
+        SELL: allow negative T (post-catalyst) or immediate if justified.
 
-        4️⃣ CONFIDENCE (0-100): Base: 7src=70, 10src=80. Bonus: optimal window +10, major FDA +10, volume spike +5. Penalty: biotech -5. Min 70.
+        4) CONFIDENCE (0-100): Base: 7src=70, 10src=80. Bonus: optimal window +10, major FDA +10, volume spike +5. Penalty: biotech -5. Min 70.
 
-        ═══ SELECTION ═══
+        ==== SELECTION ====
 
         NEW POSITIONS: Max 3-5 liquid (vol>500K/d), 2/sector, LONG only, LIMIT orders, DAY/GTC, SMART exchange.
         NO REPEAT: Skip symbols bought last 3 runs unless NEW catalyst.
+        PENDING SELLS RULE: SELL qty <= position - pending_sells_qty (otherwise warning).
+        CONTRACT RULES: security_type in {ALLOWED_SEC_TYPES}, exchange=SMART only (or empty -> SMART). LIMIT only.
+        BUDGET RULE: Total BUY <= {budget_max:.2f} EUR (80% budget). If exceeded, keep order but add warning.
         IBKR EU: ETFs=UCITS only (no SPY/QQQ). Stocks=all OK. Ticker=base only (no .AS/.PA). Currency=match domicile.
 
-        ═══ OUTPUT ═══
+        ==== OUTPUT ====
 
         Each order: symbol, action (BUY/SELL), quantity, limit_price, currency, exchange, rationale.
-        catalyst_timing: {{catalyst_description, catalyst_datetime (ISO), time_to_catalyst_hours (BUY: +[2,48], SELL: can be -), entry_timing_rationale, timing_risk_level}}
-        confidence_score: 70-100. source_count: ≥7. dedicated_sources: [{{title, url, category, relevance, publish_date}}]
+        catalyst_timing: {{catalyst_description, catalyst_datetime (ISO), time_to_catalyst_hours (BUY +[2,48], SELL can be -), entry_timing_rationale, timing_risk_level}}
+        confidence_score: 70-100. source_count: >=7. dedicated_sources: [{{title, url, category, relevance, publish_date}}]
+        warnings: list of rule deviations (e.g., budget >80%, exchange!=SMART, security_type not allowed, SELL>position-pending, BUY blocked by margin). Do not drop the order; just declare the warnings.
 
         OrderPlan: summary (FR), key_points (FR), budget_eur={budget_eur:.2f}, estimated_total_eur, orders[], sources[], macro_sources[], disclaimer (FR).
 
-        ═══ QA CHECKLIST ═══
-        □ Analyzed ALL positions? □ SELL if Priority 1/2? □ Each order 7+ sources? □ Exact catalyst_datetime?
-        □ BUY: T∈[2,48]h? SELL: T justified? □ Confidence ≥70 (≥80 edge)? □ Total ≤ {budget_max:.2f}? □ No repeats?
+        ==== QA CHECKLIST ====
+        - Analyzed ALL positions? - SELL if Priority 1/2? - Each order 7+ sources? - Exact catalyst_datetime?
+        - BUY: T in [2,48]h? SELL: T justified? - Confidence >=70 (>=80 edge)? - Total <= {budget_max:.2f}? - No repeats?
 
         Schema: {json.dumps(schema_json, indent=2, ensure_ascii=True)}
         """
