@@ -156,6 +156,7 @@ def collect_positions(portfolio_items, account):
                 "local_symbol": contract.localSymbol,
                 "security_type": contract.secType,
                 "exchange": contract.exchange,
+                "primary_exchange": getattr(contract, "primaryExchange", "") or "",
                 "currency": contract.currency,
                 "position": position_qty,
                 "avg_cost": avg_cost,
@@ -205,6 +206,8 @@ def collect_pending_orders(ib, currency, fx_rate_usd_to_eur):
                 else None,
                 "order_type": trade.order.orderType,
                 "currency": contract.currency,
+                "exchange": getattr(contract, "exchange", "") or "",
+                "primary_exchange": getattr(contract, "primaryExchange", "") or "",
             }
         )
 

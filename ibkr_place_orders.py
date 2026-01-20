@@ -179,6 +179,7 @@ def find_position(spec, positions):
     currency = normalize_text(spec.get("currency"))
     sec_type = normalize_text(spec.get("security_type"))
     exchange = normalize_text(spec.get("exchange"))
+    primary_exchange = normalize_text(spec.get("primary_exchange"))
 
     candidates = [p for p in positions if normalize_text(p.get("symbol")) == symbol]
     if currency:
@@ -188,6 +189,13 @@ def find_position(spec, positions):
     # Only filter by exchange if the position has a non-empty exchange
     if exchange:
         candidates = [p for p in candidates if not normalize_text(p.get("exchange")) or normalize_text(p.get("exchange")) == exchange]
+
+    if primary_exchange:
+        candidates = [
+            p
+            for p in candidates
+            if normalize_text(p.get("primary_exchange")) == primary_exchange
+        ]
 
     if not candidates:
         return None
@@ -219,6 +227,7 @@ def validate_sell_quantity(spec, positions, pending_sells=None):
             normalize_text(spec.get("currency")),
             normalize_text(spec.get("security_type") or "STK"),
             normalize_text(spec.get("exchange")) or "SMART",
+            normalize_text(spec.get("primary_exchange")),
         )
         pending_qty = pending_sells.get(key, 0.0)
     available = float(held) - float(pending_qty)
@@ -308,6 +317,7 @@ def build_pending_sells_map(positions_data):
             normalize_text(order.get("currency")),
             normalize_text(order.get("security_type") or "STK"),
             normalize_text(order.get("exchange")) or "SMART",
+            normalize_text(order.get("primary_exchange")),
         )
         qty = order.get("quantity", 0) or 0
         try:
@@ -417,6 +427,14 @@ def validate_instrument(spec):
             f"exchange {exchange} not allowed. Use SMART or leave empty for SMART routing."
         )
 
+    # Europe-only safety: avoid USD instruments (typically US listings).
+    # If you want multi-currency Europe (CHF/GBP/etc), keep those currencies.
+    currency = normalize_text(spec.get("currency"))
+    if currency == "USD":
+        raise ValueError(
+            "USD instruments are blocked (Europe-only mode). Use an EU listing/currency."
+        )
+
     # ETF: blocage explicite des tickers US non-UCITS
     if sec_type == "ETF":
         symbol = normalize_text(spec.get("symbol"))
@@ -438,15 +456,17 @@ def build_contract(spec):
     symbol = str(spec["symbol"]).upper()
     exchange = spec.get("exchange")
     currency = spec.get("currency")
+    primary_exchange = spec.get("primary_exchange")
 
     # Enforce whitelist for instruments/exchange
     validate_instrument(spec)
 
     safe_exchange = exchange or "SMART"
-    safe_currency = currency or "USD"
+    safe_currency = currency or "EUR"
+    safe_primary_exchange = str(primary_exchange).upper() if primary_exchange else ""
 
     if sec_type == "STK":
-        return Stock(symbol, safe_exchange, safe_currency)
+        return Stock(symbol, safe_exchange, safe_currency, primaryExchange=safe_primary_exchange)
     if sec_type == "ETF":
         # ETFs need explicit Contract with secType="ETF"
         contract = Contract()
@@ -454,6 +474,8 @@ def build_contract(spec):
         contract.secType = "ETF"
         contract.exchange = safe_exchange
         contract.currency = safe_currency
+        if safe_primary_exchange:
+            contract.primaryExchange = safe_primary_exchange
         return contract
 
     # Should not reach here due to whitelist, keep fallback defensive
@@ -462,6 +484,8 @@ def build_contract(spec):
     contract.secType = sec_type
     contract.exchange = safe_exchange
     contract.currency = safe_currency
+    if safe_primary_exchange:
+        contract.primaryExchange = safe_primary_exchange
     return contract
 
 

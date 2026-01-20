@@ -167,7 +167,7 @@ def ensure_markets_open(audit_payload):
     if open_markets:
         return True
 
-    msg = "Tous les marches sont fermes (week-end ou jour ferie) - pipeline arrete."
+    msg = "Marche Europe ferme (week-end ou jour ferie) - pipeline arrete."
     print(msg)
     if audit_payload is not None:
         audit_payload["status"] = "skipped_markets_closed"

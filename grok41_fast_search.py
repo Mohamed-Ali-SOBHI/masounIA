@@ -14,9 +14,7 @@ from datetime import datetime, timezone
 
 from audit_memory import build_memory_section
 from ibkr_shared import (
-    is_asia_market_open,
     is_europe_market_open,
-    is_us_market_open,
     load_dotenv,
     read_json,
     write_json,
@@ -87,12 +85,8 @@ def extract_budget_eur(positions):
 def get_open_markets(dt):
     """Retourne la liste des marches ouverts."""
     open_markets = []
-    if is_us_market_open(dt):
-        open_markets.append("US (NYSE, NASDAQ)")
     if is_europe_market_open(dt):
-        open_markets.append("Europe (Euronext, Xetra, SIX)")
-    if is_asia_market_open(dt):
-        open_markets.append("Asie (Tokyo, Hong Kong)")
+        open_markets.append("Europe (jour de bourse)")
     return open_markets
 
 
@@ -286,6 +280,7 @@ def main():
         limit_price: float | None = None
         currency: str
         exchange: str | None = None
+        primary_exchange: str | None = None
         time_in_force: str | None = None
         notes: str | None = None
         stop_loss: float | None = None
@@ -440,12 +435,14 @@ def main():
         NO REPEAT: Skip symbols bought last 3 runs unless NEW catalyst.
         PENDING SELLS RULE: SELL qty <= position - pending_sells_qty (otherwise warning).
         CONTRACT RULES: security_type in {ALLOWED_SEC_TYPES}, exchange=SMART only (or empty -> SMART). LIMIT only.
+        PRIMARY EXCHANGE: Provide primary_exchange for European stocks to avoid ambiguous tickers (examples: SBF=Paris, AEB=Amsterdam, IBIS=Xetra, LSE=London, SWX=Swiss, BVME=Milan).
         BUDGET RULE: Total BUY <= {budget_max:.2f} EUR (80% budget). If exceeded, keep order but add warning.
-        IBKR EU: ETFs=UCITS only (no SPY/QQQ). Stocks=all OK. Ticker=base only (no .AS/.PA). Currency=match domicile.
+        EUROPE ONLY: Trade European listings only. Currency MUST NOT be USD (use EUR/GBP/CHF/etc). Do NOT propose US tickers.
+        IBKR: ETFs=UCITS only (no SPY/QQQ). Stocks=Europe only. Use base ticker (no .PA/.AS), set primary_exchange.
 
         ==== OUTPUT ====
 
-        Each order: symbol, action (BUY/SELL), quantity, limit_price, currency, exchange, rationale.
+        Each order: symbol, action (BUY/SELL), quantity, limit_price, currency, exchange, primary_exchange, rationale.
         catalyst_timing: {{catalyst_description, catalyst_datetime (ISO), time_to_catalyst_hours (BUY +[2,48], SELL can be -), entry_timing_rationale, timing_risk_level}}
         confidence_score: 70-100. source_count: >=7. dedicated_sources: [{{title, url, category, relevance, publish_date}}]
         warnings: list of rule deviations (e.g., budget >80%, exchange!=SMART, security_type not allowed, SELL>position-pending, BUY blocked by margin). Do not drop the order; just declare the warnings.

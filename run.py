@@ -33,7 +33,9 @@ def main():
             open_markets = get_open_markets(now)
 
             if not open_markets:
-                print(f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] Tous les marches fermes (week-end ou jour ferie)")
+                print(
+                    f"\n[{now.strftime('%Y-%m-%d %H:%M:%S')}] Marche Europe ferme (week-end ou jour ferie)"
+                )
                 print("Le bot ne sera pas execute")
 
                 # Calcule la prochaine execution
