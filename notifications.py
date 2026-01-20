@@ -1,403 +1,302 @@
 #!/usr/bin/env python3
 """
-Système de notifications pour le bot de trading.
-Envoie des alertes par email en cas d'événements critiques.
+Système de notifications email pour MasounIA.
+Design épuré : logo centré, badge, cartes positions/ordres.
 """
 import os
 import smtplib
 from datetime import datetime
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+
+def _to_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fmt_eur(value):
+    return f"{_to_float(value):.2f} EUR"
+
+
+def _get_smtp_settings():
+    """Read SMTP settings from environment.
+
+    Returns a dict with all fields as strings (or None if not configured).
+    """
+    smtp_server = os.getenv("ALERT_SMTP_SERVER")
+    smtp_user = os.getenv("ALERT_SMTP_USER")
+    smtp_password = os.getenv("ALERT_SMTP_PASSWORD")
+    alert_email = os.getenv("ALERT_EMAIL_TO")
+
+    if not all([smtp_server, smtp_user, smtp_password, alert_email]):
+        return None
+
+    return {
+        "server": str(smtp_server),
+        "port": int(os.getenv("ALERT_SMTP_PORT", "587")),
+        "user": str(smtp_user),
+        "password": str(smtp_password),
+        "to": str(alert_email),
+    }
+
+
+def _send_smtp(settings, msg):
+    try:
+        with smtplib.SMTP(settings["server"], settings["port"]) as server:
+            server.starttls()
+            server.login(settings["user"], settings["password"])
+            server.send_message(msg)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"Erreur lors de l'envoi de l'email: {exc}")
+        return False
+
+
+def _subject_from_orders(using_margin, buy_count, sell_count):
+    if using_margin:
+        return "Margin Call"
+    if buy_count > 0 and sell_count == 0:
+        return f"{buy_count} Achat{'s' if buy_count > 1 else ''}"
+    if sell_count > 0 and buy_count == 0:
+        return f"{sell_count} Vente{'s' if sell_count > 1 else ''}"
+    if buy_count > 0 and sell_count > 0:
+        return (
+            f"{buy_count} Achat{'s' if buy_count > 1 else ''}, "
+            f"{sell_count} Vente{'s' if sell_count > 1 else ''}"
+        )
+    return "Aucun Ordre"
+
+
+def _alert_type(using_margin, orders_placed):
+    if using_margin:
+        return "CRITICAL"
+    if orders_placed and orders_placed > 0:
+        return "TRADE"
+    return "INFO"
+
+
+def _build_alert_html(subject: str, subtitle: str, body: str) -> str:
+    """Template HTML simple pour les alertes génériques."""
+    return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#f5f5f7;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f7;">
+    <tr>
+      <td align="center" style="padding:40px 16px;">
+        <table width="680" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:24px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.06);">
+          <tr>
+            <td style="padding:28px 28px 16px 28px; text-align:center;">
+              <img src="image.png" alt="MasounIA" style="height:68px; width:auto; display:block; margin:0 auto 14px auto;">
+              <div style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:#86868b;margin-bottom:6px;">Rapport d'activité</div>
+              <h1 style="margin:0;font-size:26px;font-weight:700;letter-spacing:-0.02em;color:#1d1d1f;">{subject}</h1>
+              <div style="margin-top:6px;font-size:14px;color:#86868b;">{subtitle}</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:0 28px 28px 28px;">
+              <div style="background:#f5f5f7;border-radius:16px;padding:20px;font-size:15px;line-height:1.6;color:#111827;white-space:pre-wrap;">{body}</div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
 
 
 def send_email_alert(subject, body, alert_type="INFO"):
     """
-    Envoie une alerte par email avec un design HTML moderne.
-
-    Args:
-        subject: Sujet de l'email
-        body: Corps du message
-        alert_type: Type d'alerte (INFO, WARNING, ERROR, CRITICAL)
-
-    Returns:
-        True si l'email a été envoyé avec succès, False sinon
+    Envoie une alerte par email (template simple avec logo centré).
     """
-    # Récupérer les paramètres depuis les variables d'environnement
-    smtp_server = os.getenv("ALERT_SMTP_SERVER")
-    smtp_port = int(os.getenv("ALERT_SMTP_PORT", "587"))
-    smtp_user = os.getenv("ALERT_SMTP_USER")
-    smtp_password = os.getenv("ALERT_SMTP_PASSWORD")
-    alert_email = os.getenv("ALERT_EMAIL_TO")
-
-    # Si les paramètres ne sont pas configurés, ne pas envoyer
-    if not all([smtp_server, smtp_user, smtp_password, alert_email]):
+    settings = _get_smtp_settings()
+    if settings is None:
         return False
 
-    try:
-        # Créer le message multipart
-        msg = MIMEMultipart('alternative')
-        msg['From'] = smtp_user
-        msg['To'] = alert_email
-        msg['Subject'] = f"[{alert_type}] Bot MasounIA - {subject}"
+    msg = MIMEMultipart("alternative")
+    msg["From"] = settings["user"]
+    msg["To"] = settings["to"]
+    msg["Subject"] = f"[{alert_type}] Bot MasounIA - {subject}"
 
-        # Ajouter timestamp
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # Couleurs minimalistes style Apple
-        alert_colors = {
-            "INFO": {"color": "#007AFF", "bg": "#F5F5F7"},
-            "WARNING": {"color": "#FF9500", "bg": "#FFF8E1"},
-            "ERROR": {"color": "#FF3B30", "bg": "#FFEBEE"},
-            "CRITICAL": {"color": "#D70015", "bg": "#FFEBEE"}
-        }
-
-        color_config = alert_colors.get(alert_type, alert_colors["INFO"])
-
-        # Version texte brut (fallback)
-        text_body = f"""
-Alerte du bot de trading MasounIA
-================================
-
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    text_body = f"""Alerte MasounIA
 Type: {alert_type}
 Date: {timestamp}
 
 {body}
-
-================================
-Ceci est une alerte automatique.
 """
+    html_body = _build_alert_html(subject, f"{alert_type} • {timestamp}", body)
 
-        # Version HTML minimaliste style Apple
-        html_body = f"""
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MasounIA</title>
-</head>
-<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', sans-serif; background-color: #ffffff;">
-    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #ffffff;">
-        <tr>
-            <td align="center" style="padding: 60px 20px;">
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-                <!-- Container -->
-                <table width="600" cellpadding="0" cellspacing="0">
-
-                    <!-- Logo/Titre -->
-                    <tr>
-                        <td style="padding-bottom: 8px;">
-                            <h1 style="margin: 0; font-size: 17px; font-weight: 600; color: #1d1d1f; letter-spacing: -0.02em;">
-                                MasounIA
-                            </h1>
-                        </td>
-                    </tr>
-
-                    <!-- Badge Alert Type -->
-                    <tr>
-                        <td style="padding-bottom: 32px;">
-                            <span style="display: inline-block; padding: 4px 12px; background-color: {color_config['bg']}; color: {color_config['color']}; font-size: 12px; font-weight: 600; letter-spacing: 0.01em; border-radius: 12px;">
-                                {alert_type}
-                            </span>
-                        </td>
-                    </tr>
-
-                    <!-- Sujet -->
-                    <tr>
-                        <td style="padding-bottom: 24px;">
-                            <h2 style="margin: 0; font-size: 28px; font-weight: 600; color: #1d1d1f; letter-spacing: -0.03em; line-height: 1.2;">
-                                {subject}
-                            </h2>
-                        </td>
-                    </tr>
-
-                    <!-- Corps du message -->
-                    <tr>
-                        <td style="padding-bottom: 32px;">
-                            <div style="font-size: 15px; line-height: 1.6; color: #515154; white-space: pre-wrap;">
-{body}
-                            </div>
-                        </td>
-                    </tr>
-
-                    <!-- Timestamp -->
-                    <tr>
-                        <td style="padding-bottom: 48px; border-bottom: 1px solid #d2d2d7;">
-                            <p style="margin: 0; font-size: 13px; color: #86868b;">
-                                {timestamp}
-                            </p>
-                        </td>
-                    </tr>
-
-                    <!-- Footer -->
-                    <tr>
-                        <td style="padding-top: 32px;">
-                            <p style="margin: 0; font-size: 12px; line-height: 1.5; color: #86868b;">
-                                Notification automatique de votre bot de trading.
-                            </p>
-                        </td>
-                    </tr>
-
-                </table>
-
-            </td>
-        </tr>
-    </table>
-</body>
-</html>
-"""
-
-        # Attacher les deux versions
-        part1 = MIMEText(text_body, 'plain', 'utf-8')
-        part2 = MIMEText(html_body, 'html', 'utf-8')
-
-        msg.attach(part1)
-        msg.attach(part2)
-
-        # Se connecter au serveur SMTP et envoyer
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-
-        return True
-
-    except Exception as e:
-        print(f"Erreur lors de l'envoi de l'email: {e}")
-        return False
+    return _send_smtp(settings, msg)
 
 
 def alert_execution_summary(grok_data, positions_data, orders_placed=None):
-    """Notification de resume d'execution avec analyse Grok et performances."""
-
-    # Extraire les donnees
+    """
+    Notification de résumé d'exécution avec analyse Grok et P&L.
+    """
     summary = grok_data.get("summary", "Aucune analyse disponible")
-    orders = grok_data.get("orders", [])
-    budget = positions_data.get("budget_eur", 0)
-    cash = positions_data.get("total_cash", 0)
-    nav = positions_data.get("net_liquidation", 0)
-    using_margin = positions_data.get("using_margin", False)
-    positions = positions_data.get("positions", [])
+    orders = grok_data.get("orders", []) or []
+    positions = positions_data.get("positions", []) or []
+    budget = _to_float(positions_data.get("budget_eur"))
+    cash = _to_float(positions_data.get("total_cash"))
+    nav = _to_float(positions_data.get("net_liquidation"))
+    using_margin = bool(positions_data.get("using_margin", False))
 
-    # Calculer P&L total
-    total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
+    total_pnl = sum(_to_float(p.get("unrealized_pnl"), 0.0) for p in positions)
+    realized_pnl = positions_data.get("realized_pnl_total")
+    global_pnl = total_pnl + _to_float(realized_pnl, 0.0)
+    pnl_sign = "+" if global_pnl >= 0 else ""
 
-    # Compter les ordres par type
     buy_count = sum(1 for o in orders if o.get("action") == "BUY")
     sell_count = sum(1 for o in orders if o.get("action") == "SELL")
 
-    # Construire le sujet
-    if using_margin:
-        subject = "Margin Call"
-    elif buy_count > 0 and sell_count == 0:
-        subject = f"{buy_count} Achat{'s' if buy_count > 1 else ''}"
-    elif sell_count > 0 and buy_count == 0:
-        subject = f"{sell_count} Vente{'s' if sell_count > 1 else ''}"
-    elif buy_count > 0 and sell_count > 0:
-        subject = f"{buy_count} Achat{'s' if buy_count > 1 else ''}, {sell_count} Vente{'s' if sell_count > 1 else ''}"
-    else:
-        subject = "Aucun Ordre"
+    subject = _subject_from_orders(using_margin, buy_count, sell_count)
 
-    # Créer version texte enrichie avec tableaux
-    _create_rich_email(subject, summary, positions, orders, nav, cash, budget, total_pnl, using_margin, orders_placed)
-
-
-def _create_rich_email(subject, summary, positions, orders, nav, cash, budget, total_pnl, using_margin, orders_placed):
-    """Crée un email enrichi avec tableaux et graphiques."""
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-    import os
-    from datetime import datetime
-
-    smtp_server = os.getenv("ALERT_SMTP_SERVER")
-    smtp_port = int(os.getenv("ALERT_SMTP_PORT", "587"))
-    smtp_user = os.getenv("ALERT_SMTP_USER")
-    smtp_password = os.getenv("ALERT_SMTP_PASSWORD")
-    alert_email = os.getenv("ALERT_EMAIL_TO")
-
-    if not all([smtp_server, smtp_user, smtp_password, alert_email]):
-        return False
-
-    alert_type = "CRITICAL" if using_margin else "INFO"
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    alert_colors = {
-        "INFO": {"color": "#007AFF", "bg": "#F5F5F7"},
-        "CRITICAL": {"color": "#D70015", "bg": "#FFEBEE"}
-    }
-    color_config = alert_colors.get(alert_type, alert_colors["INFO"])
-
-    # Trier positions par P&L
-    sorted_positions = sorted(positions, key=lambda p: p.get("unrealized_pnl", 0))
-
-    # Générer HTML des positions
+    # Construire HTML pour positions
     positions_html = ""
-    for pos in sorted_positions[:10]:
-        symbol = pos.get("symbol", "???")
-        pnl = pos.get("unrealized_pnl", 0)
-        pnl_pct = pos.get("unrealized_pnl_percent", 0)
+    for pos in sorted(positions, key=lambda p: p.get("unrealized_pnl", 0))[:10]:
+        symbol = pos.get("symbol", "?")
         qty = pos.get("position", 0)
-
-        pnl_color = "#34C759" if pnl >= 0 else "#FF3B30"
-        sign = "+" if pnl >= 0 else ""
-
+        pnl_val = _to_float(pos.get("unrealized_pnl"), 0.0)
+        pnl_pct = pos.get("unrealized_pnl_percent")
+        if pnl_pct is None:
+            # ibkr_export_positions.py uses pnl_percent
+            pnl_pct = pos.get("pnl_percent")
+        pnl_pct = _to_float(pnl_pct, 0.0)
+        color = "#34C759" if pnl_val >= 0 else "#FF3B30"
+        sign = "+" if pnl_val >= 0 else ""
         positions_html += f"""
         <tr>
-            <td style="padding: 12px 0; border-bottom: 1px solid #f5f5f7;">
-                <strong style="font-size: 15px; color: #1d1d1f;">{symbol}</strong>
-                <div style="font-size: 13px; color: #86868b; margin-top: 2px;">{int(qty)} actions</div>
-            </td>
-            <td style="padding: 12px 0; border-bottom: 1px solid #f5f5f7; text-align: right;">
-                <div style="font-size: 15px; font-weight: 600; color: {pnl_color};">{sign}{pnl:.2f} EUR</div>
-                <div style="font-size: 13px; color: #86868b; margin-top: 2px;">{sign}{pnl_pct:.1f}%</div>
-            </td>
+          <td style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;">
+            <strong style="font-size: 15px; color: #1d1d1f;">{symbol}</strong>
+            <div style="font-size: 13px; color: #86868b;">{int(qty)} actions</div>
+          </td>
+          <td style="padding: 10px 0; border-bottom: 1px solid #f0f0f0; text-align: right;">
+            <div style="font-size: 15px; font-weight: 600; color: {color};">{sign}{pnl_val:.2f} EUR</div>
+            <div style="font-size: 13px; color: #86868b;">{sign}{pnl_pct:.1f}%</div>
+          </td>
         </tr>
         """
 
-    # Générer HTML des ordres
     orders_html = ""
     for order in orders[:10]:
-        symbol = order.get("symbol", "???")
-        action = order.get("action", "???")
-        qty = order.get("quantity", 0)
-        price = order.get("limit_price", 0)
+        symbol = order.get("symbol", "?")
+        action = order.get("action", "?")
+        qty = _to_float(order.get("quantity"), 0.0)
+        price = order.get("limit_price")
         currency = order.get("currency", "USD")
-
         action_color = "#34C759" if action == "BUY" else "#FF3B30"
         action_bg = "#E8F5E9" if action == "BUY" else "#FFEBEE"
 
+        if price is None:
+            # When Grok outputs limit orders without pricing, show a placeholder.
+            price_str = "N/A"
+        else:
+            price_str = f"{_to_float(price):.2f}"
+
         orders_html += f"""
         <tr>
-            <td style="padding: 12px 0; border-bottom: 1px solid #f5f5f7;">
-                <span style="display: inline-block; padding: 4px 8px; background-color: {action_bg}; color: {action_color}; font-size: 11px; font-weight: 700; border-radius: 6px; margin-right: 8px;">{action}</span>
-                <strong style="font-size: 15px; color: #1d1d1f;">{symbol}</strong>
-            </td>
-            <td style="padding: 12px 0; border-bottom: 1px solid #f5f5f7; text-align: right;">
-                <div style="font-size: 15px; color: #1d1d1f;">{int(qty)} @ {price:.2f} {currency}</div>
-            </td>
+          <td style="padding: 10px 0; border-bottom: 1px solid #f0f0f0;">
+            <span style="display:inline-block;padding:4px 8px;background-color:{action_bg};color:{action_color};font-size:11px;font-weight:700;border-radius:6px;margin-right:8px;">{action}</span>
+            <strong style="font-size: 15px; color: #1d1d1f;">{symbol}</strong>
+          </td>
+          <td style="padding: 10px 0; border-bottom: 1px solid #f0f0f0; text-align: right;">
+            <div style="font-size: 15px; color: #1d1d1f;">{int(qty)} @ {price_str} {currency}</div>
+          </td>
         </tr>
         """
 
-    # P&L couleur et signe
-    pnl_color = "#34C759" if total_pnl >= 0 else "#FF3B30"
-    pnl_sign = "+" if total_pnl >= 0 else ""
+    metrics_line = f"Valeur du portefeuille {_fmt_eur(nav)} • Cash {_fmt_eur(cash)}"
+    metrics_line += f" • P&L global {pnl_sign}{_to_float(global_pnl):.2f} EUR"
+    metrics_line += f" • Budget {_fmt_eur(budget)}"
 
-    # Résumé compact des métriques
-    metrics_line = f"NAV {nav:.2f} EUR • Cash {cash:.2f} EUR"
-    if total_pnl != 0:
-        metrics_line += f" • P&L {pnl_sign}{total_pnl:.2f} EUR"
-
-    html_body = f"""
-<!DOCTYPE html>
-<html>
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    html_body = f"""<!DOCTYPE html>
+<html lang="fr">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
-<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif; background-color: #ffffff;">
-    <table width="100%" cellpadding="0" cellspacing="0">
-        <tr>
-            <td align="center" style="padding: 40px 20px;">
-                <table width="600" cellpadding="0" cellspacing="0">
-
-                    <!-- Header -->
-                    <tr>
-                        <td style="padding-bottom: 8px;">
-                            <h1 style="margin: 0; font-size: 17px; font-weight: 600; color: #1d1d1f;">MasounIA</h1>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding-bottom: 24px;">
-                            <h2 style="margin: 0; font-size: 24px; font-weight: 600; color: #1d1d1f; line-height: 1.2;">{subject}</h2>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td style="padding-bottom: 32px;">
-                            <div style="font-size: 13px; color: #86868b;">{metrics_line}</div>
-                        </td>
-                    </tr>
-
-                    <!-- Analyse Grok -->
-                    <tr>
-                        <td style="padding: 20px; background-color: #f5f5f7; border-radius: 12px; margin-bottom: 24px;">
-                            <div style="font-size: 12px; font-weight: 700; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;">Analyse</div>
-                            <div style="font-size: 15px; line-height: 1.6; color: #1d1d1f;">{summary}</div>
-                        </td>
-                    </tr>
-
-                    <!-- Spacer -->
-                    <tr><td style="height: 24px;"></td></tr>
-
-                    <!-- Positions -->
-                    <tr>
-                        <td>
-                            <div style="font-size: 12px; font-weight: 700; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 16px;">Positions ({len(positions)})</div>
-                            <table width="100%" cellpadding="0" cellspacing="0">
-                                {positions_html if positions else '<tr><td style="padding: 20px; text-align: center; color: #86868b; font-size: 15px;">Aucune position</td></tr>'}
-                            </table>
-                        </td>
-                    </tr>
-
-                    <!-- Spacer -->
-                    <tr><td style="height: 24px;"></td></tr>
-
-                    <!-- Ordres -->
-                    <tr>
-                        <td>
-                            <div style="font-size: 12px; font-weight: 700; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 16px;">Ordres ({len(orders)})</div>
-                            <table width="100%" cellpadding="0" cellspacing="0">
-                                {orders_html if orders else '<tr><td style="padding: 20px; text-align: center; color: #86868b; font-size: 15px;">Aucun ordre</td></tr>'}
-                            </table>
-                        </td>
-                    </tr>
-
-                    <!-- Footer -->
-                    <tr>
-                        <td style="padding-top: 32px; padding-bottom: 24px; border-top: 1px solid #d2d2d7;">
-                            <p style="margin: 0; font-size: 12px; color: #86868b;">{timestamp}</p>
-                        </td>
-                    </tr>
-                </table>
+<body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background:#f5f5f7;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f7;">
+    <tr>
+      <td align="center" style="padding:40px 16px;">
+        <table width="680" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:24px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.06);">
+          <tr>
+            <td style="padding:28px 28px 16px 28px; text-align:center;">
+              <img src="image.png" alt="MasounIA" style="height:68px; width:auto; display:block; margin:0 auto 14px auto;">
+              <div style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:#86868b;margin-bottom:6px;">Résumé d'exécution</div>
+              <h1 style="margin:0;font-size:26px;font-weight:700;letter-spacing:-0.02em;color:#1d1d1f;">{subject}</h1>
+              <div style="margin-top:6px;font-size:14px;color:#86868b;">{metrics_line}</div>
             </td>
-        </tr>
-    </table>
+          </tr>
+          <tr>
+            <td style="padding:0 28px 28px 28px;">
+              <div style="background:#f5f5f7;border-radius:16px;padding:20px;font-size:15px;line-height:1.6;color:#111827;white-space:pre-wrap;">{summary}</div>
+              <div style="background:#f5f5f7;border-radius:16px;padding:16px;margin-top:12px;">
+                <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                  <tr>
+                    <td style="width:50%;vertical-align:top;padding-right:8px;">
+                      <div style="font-size:12px;font-weight:700;color:#6b7280;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:10px;">Positions ({len(positions)})</div>
+                      <table width="100%" cellpadding="0" cellspacing="0">
+                        {positions_html if positions else '<tr><td style="padding: 18px; text-align: center; color: #9ca3af; font-size: 14px;">Aucune position</td></tr>'}
+                      </table>
+                    </td>
+                    <td style="width:50%;vertical-align:top;padding-left:8px;">
+                      <div style="font-size:12px;font-weight:700;color:#6b7280;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:10px;">Ordres ({len(orders)})</div>
+                      <table width="100%" cellpadding="0" cellspacing="0">
+                        {orders_html if orders else '<tr><td style="padding: 18px; text-align: center; color: #9ca3af; font-size: 14px;">Aucun ordre</td></tr>'}
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+              </div>
+              <div style="border-top:1px solid #e5e7eb;padding-top:16px;margin-top:16px;font-size:12px;color:#9ca3af;text-align:left;">{timestamp}</div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
 </body>
-</html>
-"""
+</html>"""
 
-    text_body = f"""
-ANALYSE GROK
+    text_body = f"""ANALYSE GROK
 {summary}
 
 PORTEFEUILLE
-NAV: {nav:.2f} EUR
-Cash: {cash:.2f} EUR
-Budget: {budget:.2f} EUR
-P&L: {pnl_sign}{total_pnl:.2f} EUR
+Valeur du portefeuille: {_fmt_eur(nav)}
+Cash: {_fmt_eur(cash)}
+Budget: {_fmt_eur(budget)}
+P&L global: {pnl_sign}{_to_float(global_pnl):.2f} EUR
 """
 
-    try:
-        msg = MIMEMultipart('alternative')
-        msg['From'] = smtp_user
-        msg['To'] = alert_email
-        msg['Subject'] = f"[{alert_type}] Bot MasounIA - {subject}"
-
-        part1 = MIMEText(text_body, 'plain', 'utf-8')
-        part2 = MIMEText(html_body, 'html', 'utf-8')
-
-        msg.attach(part1)
-        msg.attach(part2)
-
-        import smtplib
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-
-        return True
-    except Exception as e:
-        print(f"Erreur email: {e}")
+    settings = _get_smtp_settings()
+    if settings is None:
         return False
+
+    msg = MIMEMultipart("alternative")
+    msg["From"] = settings["user"]
+    msg["To"] = settings["to"]
+    alert_type = _alert_type(using_margin, orders_placed)
+    msg["Subject"] = f"[{alert_type}] Bot MasounIA - {subject}"
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    return _send_smtp(settings, msg)
 
 
 def test_notifications():
@@ -410,13 +309,13 @@ def test_notifications():
     if send_email_alert(
         "Test de notification",
         "Ceci est un email de test. Si vous recevez cet email, les notifications fonctionnent correctement.",
-        "INFO"
+        "INFO",
     ):
-        print("[OK] Email de test envoye avec succes!")
+        print("[OK] Email de test envoyé avec succès!")
         return True
     else:
-        print("[ERREUR] Echec de l'envoi de l'email de test.")
-        print("\nVerifiez que les variables suivantes sont configurees dans .env:")
+        print("[ERREUR] Échec de l'envoi de l'email de test.")
+        print("\nVérifiez que les variables suivantes sont configurées dans .env:")
         print("  ALERT_SMTP_SERVER=smtp.gmail.com")
         print("  ALERT_SMTP_PORT=587")
         print("  ALERT_SMTP_USER=votre.email@gmail.com")
@@ -426,7 +325,6 @@ def test_notifications():
 
 
 if __name__ == "__main__":
-    # Test si exécuté directement
     from ibkr_shared import load_dotenv
     load_dotenv(".env")
     test_notifications()

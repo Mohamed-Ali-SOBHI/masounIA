@@ -7,7 +7,6 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 
 def get_recent_audits(audit_dir: str = "audit", lookback_hours: int = 72) -> list[dict]:
@@ -75,7 +74,7 @@ def get_recent_audits(audit_dir: str = "audit", lookback_hours: int = 72) -> lis
         try:
             with open(orders_path, "r", encoding="utf-8") as f:
                 orders_data = json.load(f)
-        except Exception as e:
+        except Exception:
             # orders.json peut manquer si erreur avant grok
             pass
 

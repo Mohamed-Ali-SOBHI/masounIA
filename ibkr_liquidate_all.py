@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Liquide toutes les positions du compte IBKR.
-Usage: python ibkr_liquidate_all.py [--submit]
+Liquide les positions du compte IBKR (toutes ou uniquement les shorts).
+Usage: python ibkr_liquidate_all.py [--submit] [--short-only]
 """
 import argparse
 import os
 import sys
 
-from ibkr_shared import load_dotenv
+from ibkr_shared import load_dotenv, resolve_ibkr_account
 
 
 def main():
@@ -41,6 +41,11 @@ def main():
         help="Seconds to wait for market data per position.",
     )
     parser.add_argument(
+        "--short-only",
+        action="store_true",
+        help="Fermer uniquement les positions short (ignore les positions long).",
+    )
+    parser.add_argument(
         "--limit-buffer-bps",
         type=float,
         default=25.0,
@@ -63,14 +68,10 @@ def main():
     try:
         ib.connect(args.host, args.port, clientId=args.client_id)
 
-        account = args.account
-        if not account:
-            accounts = ib.managedAccounts()
-            if len(accounts) == 1:
-                account = accounts[0]
-            elif accounts:
-                print("Multiple accounts found, use --account.", file=sys.stderr)
-                return 2
+        account, account_error = resolve_ibkr_account(ib, args.account)
+        if account_error:
+            print(account_error, file=sys.stderr)
+            return 2
 
         # Wait for portfolio to populate
         ib.sleep(args.wait)
@@ -88,13 +89,23 @@ def main():
             print(f"No positions found for account {account}.")
             return 0
 
-        print(f"Found {len(portfolio_items)} position(s) to liquidate:")
+        targets = portfolio_items
+        if args.short_only:
+            targets = [p for p in portfolio_items if p.position < 0]
+            skipped = len(portfolio_items) - len(targets)
+            if skipped:
+                print(f"Short-only: {skipped} long position(s) ignored.")
+            if not targets:
+                print("No short positions to close. Nothing to do.")
+                return 0
+
+        print(f"Found {len(targets)} position(s) to liquidate:")
         print("=" * 80)
 
         orders_placed = []
         total_value = 0.0
 
-        for idx, item in enumerate(portfolio_items, 1):
+        for idx, item in enumerate(targets, 1):
             contract = item.contract
             position = item.position
             market_price = item.marketPrice
@@ -185,7 +196,7 @@ def main():
             print()
 
         print("=" * 80)
-        print(f"Total positions: {len(portfolio_items)}")
+        print(f"Total positions targeted: {len(targets)}")
         print(f"Total market value: {total_value:,.2f}")
 
         if args.submit:

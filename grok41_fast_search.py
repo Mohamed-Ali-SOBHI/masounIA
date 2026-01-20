@@ -1,121 +1,36 @@
 #!/usr/bin/env python3
+"""Grok runner.
+
+Calls xAI Grok (via xai-sdk) with web search tools, validates the response
+against a Pydantic schema and prints the resulting JSON.
+"""
+
 import argparse
 import json
 import os
 import sys
 import textwrap
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 from audit_memory import build_memory_section
-from ibkr_shared import load_dotenv, read_json, write_json
+from ibkr_shared import (
+    is_asia_market_open,
+    is_europe_market_open,
+    is_us_market_open,
+    load_dotenv,
+    read_json,
+    write_json,
+)
 
-# Instruments autorisés pour la génération d'ordres (cohérent avec l'exécution IBKR)
+# Instruments autorises pour la generation d'ordres (coherent avec l'execution IBKR)
 ALLOWED_SEC_TYPES = ["STK", "ETF"]
 
-
-def _ensure_aware(dt):
-    """Force un datetime timezone-aware (UTC par défaut si naïf)."""
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
+DEFAULT_QUERY = (
+    "Analyse les news des dernieres 48-72h et propose des trades bases sur les catalyseurs actuels."
+)
 
 
-def _within_session(dt_local, start_hour, start_minute, end_hour, end_minute):
-    """Vérifie que dt_local est dans la plage horaire [start, end]."""
-    start = dt_local.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
-    end = dt_local.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
-    return start <= dt_local <= end
-
-
-def extract_budget_eur(positions):
-    if not isinstance(positions, dict):
-        return None
-    value = positions.get("budget_eur")
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
-
-
-def is_us_market_open(dt):
-    """Verifie si les marches US (NYSE, NASDAQ) sont ouverts."""
-    dt_local = _ensure_aware(dt).astimezone(ZoneInfo("America/New_York"))
-    if dt_local.weekday() >= 5:
-        return False
-    year, month, day = dt_local.year, dt_local.month, dt_local.day
-    fixed_holidays = [(1, 1), (7, 4), (12, 25)]
-    if (month, day) in fixed_holidays:
-        return False
-    if month == 1 and dt_local.weekday() == 0 and 15 <= day <= 21:
-        return False
-    if month == 2 and dt_local.weekday() == 0 and 15 <= day <= 21:
-        return False
-    good_fridays = {2025: (4, 18), 2026: (4, 3), 2027: (3, 26), 2028: (4, 14), 2029: (3, 30), 2030: (4, 19)}
-    if year in good_fridays and (month, day) == good_fridays[year]:
-        return False
-    if month == 5 and dt_local.weekday() == 0 and day >= 25:
-        return False
-    if month == 9 and dt_local.weekday() == 0 and day <= 7:
-        return False
-    if month == 11 and dt_local.weekday() == 3 and 22 <= day <= 28:
-        return False
-    # Horaires réguliers: 09:30-16:00 America/New_York
-    return _within_session(dt_local, 9, 30, 16, 0)
-
-
-def is_europe_market_open(dt):
-    """Verifie si les marches europeens (Euronext, Xetra, SIX) sont ouverts."""
-    dt_local = _ensure_aware(dt).astimezone(ZoneInfo("Europe/Paris"))
-    if dt_local.weekday() >= 5:
-        return False
-    year, month, day = dt_local.year, dt_local.month, dt_local.day
-    common_holidays = [(1, 1), (12, 25)]
-    if (month, day) in common_holidays:
-        return False
-    easter_mondays = {2025: (4, 21), 2026: (4, 6), 2027: (3, 29), 2028: (4, 17), 2029: (4, 2), 2030: (4, 22)}
-    if year in easter_mondays and (month, day) == easter_mondays[year]:
-        return False
-    good_fridays = {2025: (4, 18), 2026: (4, 3), 2027: (3, 26), 2028: (4, 14), 2029: (3, 30), 2030: (4, 19)}
-    if year in good_fridays and (month, day) == good_fridays[year]:
-        return False
-    if month == 5 and day == 1:
-        return False
-    # Horaires réguliers: 09:00-17:30 Europe/Paris
-    return _within_session(dt_local, 9, 0, 17, 30)
-
-
-def is_asia_market_open(dt):
-    """Verifie si les marches asiatiques (Tokyo, Hong Kong) sont ouverts."""
-    dt_tokyo = _ensure_aware(dt).astimezone(ZoneInfo("Asia/Tokyo"))
-    dt_hk = dt_tokyo.astimezone(ZoneInfo("Asia/Hong_Kong"))
-
-    if dt_tokyo.weekday() >= 5:
-        return False
-    month, day = dt_tokyo.month, dt_tokyo.day
-    common_holidays = [(1, 1), (12, 25)]
-    if (month, day) in common_holidays:
-        return False
-    # Horaires approximatifs:
-    # - Tokyo: 09:00-15:00 JST
-    # - Hong Kong: 09:30-16:00 HKT
-    tokyo_open = _within_session(dt_tokyo, 9, 0, 15, 0)
-    hk_open = _within_session(dt_hk, 9, 30, 16, 0)
-    return tokyo_open or hk_open
-
-
-def get_open_markets(dt):
-    """Retourne la liste des marches ouverts."""
-    open_markets = []
-    if is_us_market_open(dt):
-        open_markets.append("US (NYSE, NASDAQ)")
-    if is_europe_market_open(dt):
-        open_markets.append("Europe (Euronext, Xetra, SIX)")
-    if is_asia_market_open(dt):
-        open_markets.append("Asie (Tokyo, Hong Kong)")
-    return open_markets
-
-
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Call xAI Grok 4.1 Fast with web_search + x_search tools and JSON schema output."
@@ -127,13 +42,20 @@ def main():
         help="User question or task (default: analyze recent news and propose trades).",
     )
     parser.add_argument(
-        "--model", default="grok-4-1-fast-reasoning", help="Model name (default: grok-4-1-fast-reasoning)."
+        "--model",
+        default="grok-4-1-fast-reasoning",
+        help="Model name (default: grok-4-1-fast-reasoning).",
     )
     parser.add_argument(
-        "--base-url", default="https://api.x.ai/v1", help="xAI API base URL (ignored with SDK)."
+        "--base-url",
+        default="https://api.x.ai/v1",
+        help="xAI API base URL (ignored with SDK).",
     )
     parser.add_argument(
-        "--timeout", type=int, default=3600, help="Request timeout in seconds (default: 3600s = 1h for reasoning models)."
+        "--timeout",
+        type=int,
+        default=3600,
+        help="Request timeout in seconds (default: 3600s = 1h for reasoning models).",
     )
     parser.add_argument("--raw", action="store_true", help="Print raw model output.")
     parser.add_argument(
@@ -150,88 +72,115 @@ def main():
         "--dump-messages",
         help="Write the model messages payload to a JSON file.",
     )
-    args = parser.parse_args()
+    return parser
 
-    load_dotenv(".env")
+
+def extract_budget_eur(positions):
+    if not isinstance(positions, dict):
+        return None
+    value = positions.get("budget_eur")
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def get_open_markets(dt):
+    """Retourne la liste des marches ouverts."""
+    open_markets = []
+    if is_us_market_open(dt):
+        open_markets.append("US (NYSE, NASDAQ)")
+    if is_europe_market_open(dt):
+        open_markets.append("Europe (Euronext, Xetra, SIX)")
+    if is_asia_market_open(dt):
+        open_markets.append("Asie (Tokyo, Hong Kong)")
+    return open_markets
+
+
+def load_api_key():
     api_key = os.getenv("XAI_API_KEY")
     if not api_key:
-        print("Missing XAI_API_KEY env var. Put it in .env or export it.", file=sys.stderr)
-        return 2
+        print(
+            "Missing XAI_API_KEY env var. Put it in .env or export it.",
+            file=sys.stderr,
+        )
+        return None
+    return api_key
 
-    if not args.query:
-        args.query = "Analyse les news des dernieres 48-72h et propose des trades bases sur les catalyseurs actuels."
 
-    positions = read_json(args.positions)
-    positions_json = json.dumps(positions, ensure_ascii=True)
+def load_positions(path):
+    positions = read_json(path)
+    pending_orders = []
+    if isinstance(positions, dict):
+        pending_orders = positions.get("pending_orders", [])
+    return positions, pending_orders
 
-    # Extraire les ordres en attente pour éviter les positions SHORT accidentelles
-    pending_orders = positions.get("pending_orders", [])
-    pending_orders_json = json.dumps(pending_orders, ensure_ascii=True)
 
-    # Vérifier si le compte utilise de la marge et détecter les positions short
+def validate_positions_or_exit(positions):
+    """Validate IBKR positions JSON for safety.
+
+    Returns:
+        (using_margin, total_cash, margin_call_mode)
+    """
     using_margin = False
     total_cash = None
     margin_call_mode = False
-    has_short_positions = False
 
-    if isinstance(positions, dict):
-        using_margin = positions.get("using_margin", False)
-        total_cash = positions.get("total_cash")
+    if not isinstance(positions, dict):
+        return using_margin, total_cash, margin_call_mode
 
-        # Détecter les positions short (position négative)
-        pos_list = positions.get("positions", [])
-        for pos in pos_list:
-            position_qty = pos.get("position", 0)
-            if position_qty < 0:
-                has_short_positions = True
-                print("=" * 60, file=sys.stderr)
-                print("ERREUR - Position SHORT detectee", file=sys.stderr)
-                print("=" * 60, file=sys.stderr)
-                print(f"Symbole: {pos.get('symbol')}", file=sys.stderr)
-                print(f"Position: {position_qty:,.0f} (NEGATIF = SHORT)", file=sys.stderr)
-                print("", file=sys.stderr)
-                print("Le bot est configure LONG ONLY.", file=sys.stderr)
-                print("Les positions SHORT doivent etre fermees manuellement.", file=sys.stderr)
-                print("Utilisez ibkr_liquidate_all.py pour fermer toutes les positions.", file=sys.stderr)
-                print("=" * 60, file=sys.stderr)
+    using_margin = positions.get("using_margin", False)
+    total_cash = positions.get("total_cash")
 
-        if has_short_positions:
-            return 2
-
-        if using_margin or (total_cash is not None and total_cash < 0):
-            margin_call_mode = True
+    for pos in positions.get("positions", []) or []:
+        position_qty = pos.get("position", 0)
+        if position_qty < 0:
             print("=" * 60, file=sys.stderr)
-            print("ALERTE MARGE - Cash negatif detecte", file=sys.stderr)
+            print("ERREUR - Position SHORT detectee", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
-            if total_cash is not None:
-                print(f"Cash actuel: {total_cash:,.2f} EUR (NEGATIF!)", file=sys.stderr)
-                print(f"Montant a recuperer: {abs(total_cash):,.2f} EUR", file=sys.stderr)
+            print(f"Symbole: {pos.get('symbol')}", file=sys.stderr)
+            print(f"Position: {position_qty:,.0f} (NEGATIF = SHORT)", file=sys.stderr)
             print("", file=sys.stderr)
-            print("Le bot va proposer des VENTES pour corriger la situation.", file=sys.stderr)
-            print("AUCUN ACHAT ne sera autorise tant que le cash n'est pas positif.", file=sys.stderr)
-            print("=" * 60, file=sys.stderr)
-
-        budget_currency = positions.get("budget_currency")
-        if budget_currency and budget_currency != "EUR":
+            print("Le bot est configure LONG ONLY.", file=sys.stderr)
+            print("Les positions SHORT doivent etre fermees manuellement.", file=sys.stderr)
             print(
-                f"Positions JSON budget_currency is {budget_currency}, expected EUR.",
+                "Utilisez ibkr_liquidate_all.py pour fermer toutes les positions.",
                 file=sys.stderr,
             )
-            return 2
+            print("=" * 60, file=sys.stderr)
+            raise ValueError("short_position_detected")
 
-    budget_eur = args.budget_eur
+    if using_margin or (total_cash is not None and total_cash < 0):
+        margin_call_mode = True
+        print("=" * 60, file=sys.stderr)
+        print("ALERTE MARGE - Cash negatif detecte", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        if total_cash is not None:
+            print(f"Cash actuel: {total_cash:,.2f} EUR (NEGATIF!)", file=sys.stderr)
+            print(f"Montant a recuperer: {abs(total_cash):,.2f} EUR", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Le bot va proposer des VENTES pour corriger la situation.", file=sys.stderr)
+        print("AUCUN ACHAT ne sera autorise tant que le cash n'est pas positif.", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+
+    budget_currency = positions.get("budget_currency")
+    if budget_currency and budget_currency != "EUR":
+        print(
+            f"Positions JSON budget_currency is {budget_currency}, expected EUR.",
+            file=sys.stderr,
+        )
+        raise ValueError("budget_currency_not_eur")
+
+    return using_margin, total_cash, margin_call_mode
+
+
+def resolve_budget(positions, override_budget_eur):
+    budget_eur = override_budget_eur
     if budget_eur is None:
-        budget_from_positions = extract_budget_eur(positions)
-        if budget_from_positions is None:
+        budget_eur = extract_budget_eur(positions)
+        if budget_eur is None:
             print("Positions JSON missing budget_eur.", file=sys.stderr)
-            return 2
-        budget_eur = budget_from_positions
+            return None
 
-    if budget_eur is None:
-        print("Budget must be provided via positions JSON or --budget-eur.", file=sys.stderr)
-        return 2
-
-    # Bloquer si budget negatif (situation anormale - positions short ou probleme)
     if budget_eur < 0:
         print("=" * 60, file=sys.stderr)
         print("ERREUR - Budget negatif detecte", file=sys.stderr)
@@ -241,22 +190,53 @@ def main():
         print("Causes possibles:", file=sys.stderr)
         print("1. Positions SHORT detectees (le bot est LONG ONLY)", file=sys.stderr)
         print("2. Utilisation excessive de marge", file=sys.stderr)
-        print("3. AvailableFunds negatif (changez IBKR_BUDGET_TAG=TotalCashValue dans .env)", file=sys.stderr)
+        print(
+            "3. AvailableFunds negatif (changez IBKR_BUDGET_TAG=TotalCashValue dans .env)",
+            file=sys.stderr,
+        )
         print("", file=sys.stderr)
         print("Le bot ne peut PAS trader avec un budget negatif.", file=sys.stderr)
         print("Fermez toutes les positions SHORT manuellement.", file=sys.stderr)
         print("=" * 60, file=sys.stderr)
+        return None
+
+    return float(budget_eur)
+
+
+def build_markets_context(current_time):
+    open_markets = get_open_markets(current_time)
+    if open_markets:
+        markets_str = ", ".join(open_markets)
+        return f"MARCHES OUVERTS AUJOURD'HUI: {markets_str}"
+    return "ATTENTION: Tous les marches majeurs sont FERMES (week-end ou jour ferie)"
+
+
+def main():
+    args = build_arg_parser().parse_args()
+
+    load_dotenv(".env")
+    api_key = load_api_key()
+    if not api_key:
+        return 2
+
+    query = args.query or DEFAULT_QUERY
+
+    positions, pending_orders = load_positions(args.positions)
+    positions_json = json.dumps(positions, ensure_ascii=True)
+    pending_orders_json = json.dumps(pending_orders, ensure_ascii=True)
+
+    try:
+        _using_margin, total_cash, margin_call_mode = validate_positions_or_exit(positions)
+    except ValueError:
+        return 2
+
+    budget_eur = resolve_budget(positions, args.budget_eur)
+    if budget_eur is None:
         return 2
 
     current_time = datetime.now(timezone.utc)
 
-    # Detecter quels marches sont ouverts
-    open_markets = get_open_markets(current_time)
-    if open_markets:
-        markets_str = ", ".join(open_markets)
-        markets_context = f"MARCHES OUVERTS AUJOURD'HUI: {markets_str}"
-    else:
-        markets_context = "ATTENTION: Tous les marches majeurs sont FERMES (week-end ou jour ferie)"
+    markets_context = build_markets_context(current_time)
 
     # Build memory context from recent audits
     memory_context = build_memory_section(
@@ -487,7 +467,7 @@ def main():
     ]
     if pending_orders:
         messages_list.append({"role": "user", "content": f"Pending Orders (JSON): {pending_orders_json}"})
-    messages_list.append({"role": "user", "content": args.query})
+    messages_list.append({"role": "user", "content": query})
 
     messages_payload = {
         "model": args.model,
@@ -508,7 +488,7 @@ def main():
     chat.append(user(f"Positions IBKR (JSON): {positions_json}"))
     if pending_orders:
         chat.append(user(f"Pending Orders (JSON): {pending_orders_json}"))
-    chat.append(user(args.query))
+    chat.append(user(query))
 
     try:
         response = chat.sample()

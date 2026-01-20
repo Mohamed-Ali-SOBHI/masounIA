@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""IBKR order executor.
+
+Reads Grok-generated orders JSON, validates safety constraints (LONG only,
+LIMIT only, budget cap, UCITS ETF restrictions), optionally connects to IBKR to
+price missing limit prices, qualify contracts and submit orders.
+"""
+
 import argparse
 import json
 import math
@@ -6,13 +13,6 @@ import os
 import sys
 
 from ibkr_shared import load_dotenv, read_json, write_json
-
-
-def normalize_forex_symbol(symbol):
-    compact = symbol.upper().replace("/", "").replace(".", "")
-    if len(compact) == 6:
-        return compact
-    return symbol.upper()
 
 
 def is_valid_number(value):
@@ -60,6 +60,118 @@ BANNED_US_ETF_TICKERS = {
     "XLC",
     "XLB",
 }
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Place IBKR orders from Grok JSON output.")
+    parser.add_argument(
+        "json_path",
+        help="Path to JSON file (or - for stdin).",
+    )
+    parser.add_argument("--host", default=os.getenv("IBKR_HOST", "127.0.0.1"))
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("IBKR_PORT", "7497")),
+        help="TWS paper default 7497, live default 7496, IB Gateway paper 4002.",
+    )
+    parser.add_argument(
+        "--client-id",
+        type=int,
+        default=int(os.getenv("IBKR_CLIENT_ID", "1")),
+    )
+    parser.add_argument("--account", default=os.getenv("IBKR_ACCOUNT"))
+    parser.add_argument(
+        "--positions",
+        help="Path to IBKR positions JSON for sell validation.",
+    )
+    parser.add_argument(
+        "--budget-eur",
+        type=float,
+        help="Override budget in EUR for buy total checks.",
+    )
+    parser.add_argument(
+        "--limit-buffer-bps",
+        type=float,
+        default=float(os.getenv("IBKR_LIMIT_BUFFER_BPS", "25")),
+        help="Limit price buffer in bps (default: 25).",
+    )
+    parser.add_argument(
+        "--md-wait",
+        type=float,
+        default=float(os.getenv("IBKR_MD_WAIT", "1.5")),
+        help="Seconds to wait for market data (default: 1.5).",
+    )
+    parser.add_argument(
+        "--enriched-out",
+        help="Write enriched orders JSON with computed prices.",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Connect to IBKR to qualify contracts without placing orders.",
+    )
+    parser.add_argument(
+        "--submit",
+        action="store_true",
+        help="Place orders in IBKR (implies --check).",
+    )
+    return parser
+
+
+def load_positions_budget_and_pending_sells(args, data):
+    positions_data = None
+    positions_list = None
+    pending_sells_map = {}
+
+    budget_eur = args.budget_eur
+    if budget_eur is None and is_valid_number(data.get("budget_eur")):
+        budget_eur = float(data.get("budget_eur"))
+
+    if args.positions:
+        positions_data = read_json(args.positions)
+        if isinstance(positions_data, dict):
+            positions_list = positions_data.get("positions")
+            pending_sells_map = build_pending_sells_map(positions_data)
+            if budget_eur is None and is_valid_number(positions_data.get("budget_eur")):
+                budget_eur = float(positions_data.get("budget_eur"))
+
+    return positions_data, positions_list, budget_eur, pending_sells_map
+
+
+def validate_orders_input(orders, positions_list, pending_sells_map):
+    for spec in orders:
+        validate_order_spec(spec)
+        validate_instrument(spec)
+
+        if normalize_text(spec.get("action")) == "SELL" and positions_list is None:
+            raise ValueError("SELL orders require --positions for validation.")
+
+        if positions_list is not None:
+            validate_sell_quantity(spec, positions_list, pending_sells_map)
+
+
+def any_missing_limit_prices(orders):
+    return any(
+        normalize_text(spec.get("order_type")) in ("LMT", "LIMIT")
+        and spec.get("limit_price") is None
+        for spec in orders
+    )
+
+
+def apply_pending_order_dedup(ib, orders, data, args):
+    """Remove orders that are duplicates of pending IBKR orders."""
+    pending_keys = build_pending_order_keys(ib, args.account)
+    orders, blocked = filter_duplicate_pending_orders(orders, pending_keys)
+    if blocked["BUY"] or blocked["SELL"]:
+        data["orders"] = orders
+        for action in ("BUY", "SELL"):
+            for symbol, currency, sec_type in sorted(blocked[action]):
+                print(
+                    f"Blocked duplicate pending {action}: {symbol} {currency} {sec_type}",
+                    file=sys.stderr,
+                )
+    return orders
 
 
 def find_position(spec, positions):
@@ -206,6 +318,93 @@ def build_pending_sells_map(positions_data):
     return pending_sells
 
 
+PENDING_ORDER_STATUSES = {
+    "PreSubmitted",
+    "Submitted",
+    "PendingSubmit",
+    "PendingCancel",
+    "ApiPending",
+}
+
+PENDING_ORDER_STATUSES_UPPER = {s.upper() for s in PENDING_ORDER_STATUSES}
+
+
+def _normalize_account(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _order_key(symbol, currency, sec_type):
+    sym = normalize_text(symbol)
+    ccy = normalize_text(currency)
+    st = normalize_text(sec_type)
+    if not sym or not ccy or not st:
+        return None
+    return (sym, ccy, st)
+
+
+def order_key_from_spec(spec):
+    return _order_key(
+        spec.get("symbol"),
+        spec.get("currency"),
+        spec.get("security_type") or "STK",
+    )
+
+
+def order_key_from_trade(trade):
+    contract = getattr(trade, "contract", None)
+    return _order_key(
+        getattr(contract, "symbol", ""),
+        getattr(contract, "currency", ""),
+        getattr(contract, "secType", ""),
+    )
+
+
+def build_pending_order_keys(ib, account=None):
+    """Collect pending BUY/SELL keys from IBKR openTrades()."""
+    desired_account = _normalize_account(account)
+    keys = {"BUY": set(), "SELL": set()}
+
+    for trade in ib.openTrades() or []:
+        status = normalize_text(getattr(getattr(trade, "orderStatus", None), "status", ""))
+        if status not in PENDING_ORDER_STATUSES_UPPER:
+            continue
+
+        order = getattr(trade, "order", None)
+        action = normalize_text(getattr(order, "action", ""))
+        if action not in keys:
+            continue
+
+        if desired_account:
+            trade_account = _normalize_account(getattr(order, "account", None))
+            if trade_account and trade_account != desired_account:
+                continue
+
+        key = order_key_from_trade(trade)
+        if key is not None:
+            keys[action].add(key)
+
+    return keys
+
+
+def filter_duplicate_pending_orders(orders, pending_keys_by_action):
+    """Drop orders that are duplicates of pending IBKR orders."""
+    filtered = []
+    blocked = {"BUY": set(), "SELL": set()}
+
+    for spec in orders:
+        action = normalize_text(spec.get("action"))
+        if action in blocked:
+            key = order_key_from_spec(spec)
+            if key is not None and key in pending_keys_by_action.get(action, set()):
+                blocked[action].add(key)
+                continue
+        filtered.append(spec)
+
+    return filtered, blocked
+
+
 def validate_instrument(spec):
     sec_type = str(spec.get("security_type") or "STK").upper()
     if sec_type not in ALLOWED_SEC_TYPES:
@@ -233,7 +432,7 @@ def validate_instrument(spec):
 
 
 def build_contract(spec):
-    from ib_insync import CFD, Contract, Crypto, Forex, Stock
+    from ib_insync import Contract, Stock
 
     sec_type = str(spec.get("security_type") or "STK").upper()
     symbol = str(spec["symbol"]).upper()
@@ -267,24 +466,16 @@ def build_contract(spec):
 
 
 def build_order(spec, account):
-    from ib_insync import LimitOrder, MarketOrder, Order
+    from ib_insync import LimitOrder
 
-    action = str(spec["action"]).upper()
+    # Safety: this project enforces LIMIT only.
+    action = normalize_text(spec.get("action"))
     quantity = float(spec["quantity"])
-    order_type = str(spec["order_type"]).upper()
+    limit_price = spec.get("limit_price")
+    if limit_price is None:
+        raise ValueError("limit_price is required for LIMIT orders")
 
-    if order_type in ("MKT", "MARKET"):
-        ib_order = MarketOrder(action, quantity)
-    elif order_type in ("LMT", "LIMIT"):
-        limit_price = float(spec["limit_price"])
-        ib_order = LimitOrder(action, quantity, limit_price)
-    else:
-        ib_order = Order()
-        ib_order.action = action
-        ib_order.orderType = order_type
-        ib_order.totalQuantity = quantity
-        if spec.get("limit_price") is not None:
-            ib_order.lmtPrice = float(spec["limit_price"])
+    ib_order = LimitOrder(action, quantity, float(limit_price))
 
     tif = spec.get("time_in_force")
     if tif:
@@ -296,108 +487,28 @@ def build_order(spec, account):
 
 def main():
     load_dotenv(".env")
-    parser = argparse.ArgumentParser(
-        description="Place IBKR orders from Grok JSON output."
-    )
-    parser.add_argument(
-        "json_path",
-        help="Path to JSON file (or - for stdin).",
-    )
-    parser.add_argument("--host", default=os.getenv("IBKR_HOST", "127.0.0.1"))
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.getenv("IBKR_PORT", "7497")),
-        help="TWS paper default 7497, live default 7496, IB Gateway paper 4002.",
-    )
-    parser.add_argument(
-        "--client-id",
-        type=int,
-        default=int(os.getenv("IBKR_CLIENT_ID", "1")),
-    )
-    parser.add_argument("--account", default=os.getenv("IBKR_ACCOUNT"))
-    parser.add_argument(
-        "--positions",
-        help="Path to IBKR positions JSON for sell validation.",
-    )
-    parser.add_argument(
-        "--budget-eur",
-        type=float,
-        help="Override budget in EUR for buy total checks.",
-    )
-    parser.add_argument(
-        "--limit-buffer-bps",
-        type=float,
-        default=float(os.getenv("IBKR_LIMIT_BUFFER_BPS", "25")),
-        help="Limit price buffer in bps (default: 25).",
-    )
-    parser.add_argument(
-        "--md-wait",
-        type=float,
-        default=float(os.getenv("IBKR_MD_WAIT", "1.5")),
-        help="Seconds to wait for market data (default: 1.5).",
-    )
-    parser.add_argument(
-        "--enriched-out",
-        help="Write enriched orders JSON with computed prices.",
-    )
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Connect to IBKR to qualify contracts without placing orders.",
-    )
-    parser.add_argument(
-        "--submit",
-        action="store_true",
-        help="Place orders in IBKR (implies --check).",
-    )
-    args = parser.parse_args()
+    args = build_arg_parser().parse_args()
 
     data = read_json(args.json_path)
-    positions_data = None
-    positions_list = None
-    budget_eur = args.budget_eur
-    pending_sells_map = {}
-    if args.positions:
-        positions_data = read_json(args.positions)
-        if isinstance(positions_data, dict):
-            positions_list = positions_data.get("positions")
-            pending_sells_map = build_pending_sells_map(positions_data)
-            if budget_eur is None and is_valid_number(positions_data.get("budget_eur")):
-                budget_eur = float(positions_data.get("budget_eur"))
-        if not isinstance(positions_list, list):
-            print("Positions JSON missing positions list.", file=sys.stderr)
-            return 2
-    if budget_eur is None and is_valid_number(data.get("budget_eur")):
-        budget_eur = float(data.get("budget_eur"))
+    positions_data, positions_list, budget_eur, pending_sells_map = (
+        load_positions_budget_and_pending_sells(args, data)
+    )
+    if args.positions and not isinstance(positions_list, list):
+        print("Positions JSON missing positions list.", file=sys.stderr)
+        return 2
 
     orders = data.get("orders", [])
     if not isinstance(orders, list) or not orders:
         print("No orders found in JSON.", file=sys.stderr)
         return 2
 
-    for spec in orders:
-        validate_order_spec(spec)
-        try:
-            validate_instrument(spec)
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-        if normalize_text(spec.get("action")) == "SELL" and positions_list is None:
-            print("SELL orders require --positions for validation.", file=sys.stderr)
-            return 2
-        if positions_list is not None:
-            try:
-                validate_sell_quantity(spec, positions_list, pending_sells_map)
-            except ValueError as exc:
-                print(str(exc), file=sys.stderr)
-                return 2
+    try:
+        validate_orders_input(orders, positions_list, pending_sells_map)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
-    needs_prices = any(
-        normalize_text(spec.get("order_type")) in ("LMT", "LIMIT")
-        and spec.get("limit_price") is None
-        for spec in orders
-    )
+    needs_prices = any_missing_limit_prices(orders)
 
     do_connect = args.check or args.submit
     if not do_connect:
@@ -419,6 +530,18 @@ def main():
 
     ib = IB()
     ib.connect(args.host, args.port, clientId=args.client_id)
+
+    orders = apply_pending_order_dedup(ib, orders, data, args)
+
+    if not orders:
+        if args.enriched_out:
+            write_json(data, args.enriched_out)
+        print(
+            "All orders were blocked because they already exist as pending orders in IBKR.",
+            file=sys.stderr,
+        )
+        ib.disconnect()
+        return 0
 
     trades = []
     fx_cache = {}

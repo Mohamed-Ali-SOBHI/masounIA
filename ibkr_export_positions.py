@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
+"""Export IBKR positions and a conservative EUR budget.
+
+This script connects to IBKR, exports current portfolio positions, and computes
+a conservative trading budget (in EUR) that also accounts for pending BUY
+orders.
+"""
+
 import argparse
 import math
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import timezone
 
-from ibkr_shared import load_dotenv, write_json
+from ibkr_shared import load_dotenv, resolve_ibkr_account, utc_now_iso, write_json
 
 
 def to_number(value):
@@ -34,10 +41,6 @@ def calculate_pnl_percent(market_price, avg_cost):
 
     pnl_percent = ((market_price - avg_cost) / avg_cost) * 100
     return round(pnl_percent, 2)  # Arrondi a 2 decimales
-
-
-def iso_utc_now():
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def read_account_summary(ib, account):
@@ -72,8 +75,15 @@ def get_account_value(summary, tag, currency):
     return None
 
 
-def main():
-    load_dotenv(".env")
+PENDING_ORDER_STATUSES = {
+    "PreSubmitted",
+    "Submitted",
+    "PendingSubmit",
+    "PendingCancel",
+}
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Export IBKR portfolio positions to JSON for Grok."
     )
@@ -111,10 +121,134 @@ def main():
         default="-",
         help="Output path for JSON (default stdout).",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def compute_fx_rate_usd_to_eur(summary):
+    cash_usd = get_account_value(summary, "CashBalance", "USD")
+    cash_eur = get_account_value(summary, "CashBalance", "EUR")
+    if cash_usd and cash_usd != 0 and cash_eur and cash_eur != 0:
+        return cash_eur / cash_usd if cash_usd != 0 else None
+    return None
+
+
+def collect_positions(portfolio_items, account):
+    positions = []
+    has_short_positions = False
+    for item in portfolio_items:
+        if account and item.account != account:
+            continue
+        contract = item.contract
+
+        avg_cost = to_number(item.averageCost)
+        market_price = to_number(item.marketPrice)
+        pnl_percent = calculate_pnl_percent(market_price, avg_cost)
+
+        position_qty = to_number(item.position)
+        if position_qty is not None and position_qty < 0:
+            has_short_positions = True
+
+        positions.append(
+            {
+                "account": item.account,
+                "conid": contract.conId,
+                "symbol": contract.symbol,
+                "local_symbol": contract.localSymbol,
+                "security_type": contract.secType,
+                "exchange": contract.exchange,
+                "currency": contract.currency,
+                "position": position_qty,
+                "avg_cost": avg_cost,
+                "market_price": market_price,
+                "market_value": to_number(item.marketValue),
+                "unrealized_pnl": to_number(item.unrealizedPNL),
+                "realized_pnl": to_number(item.realizedPNL),
+                "pnl_percent": pnl_percent,
+            }
+        )
+    return positions, has_short_positions
+
+
+def collect_pending_orders(ib, currency, fx_rate_usd_to_eur):
+    """Collect pending orders and estimate total pending BUY value in EUR."""
+    pending_value_eur = 0.0
+    pending_value_by_currency = {}
+    pending_orders = []
+
+    open_trades = ib.openTrades()
+    for trade in open_trades:
+        order_status = trade.orderStatus.status
+        if order_status not in PENDING_ORDER_STATUSES:
+            continue
+
+        quantity = trade.order.totalQuantity
+        contract = trade.contract
+        action = trade.order.action
+
+        if hasattr(trade.order, "lmtPrice") and trade.order.lmtPrice:
+            price = trade.order.lmtPrice
+        else:
+            ib.qualifyContracts(contract)
+            ticker = ib.reqMktData(contract)
+            ib.sleep(1.0)
+            price = ticker.marketPrice() if ticker.marketPrice() else ticker.last
+            ib.cancelMktData(contract)
+
+        pending_orders.append(
+            {
+                "symbol": contract.symbol,
+                "action": action,
+                "quantity": int(quantity),
+                "status": order_status,
+                "limit_price": to_number(trade.order.lmtPrice)
+                if hasattr(trade.order, "lmtPrice")
+                else None,
+                "order_type": trade.order.orderType,
+                "currency": contract.currency,
+            }
+        )
+
+        if action == "BUY" and price and price > 0:
+            order_value = quantity * price
+            order_currency = contract.currency
+            pending_value_by_currency[order_currency] = (
+                pending_value_by_currency.get(order_currency, 0.0) + order_value
+            )
+
+    for order_currency, value in pending_value_by_currency.items():
+        if order_currency == currency:
+            pending_value_eur += value
+        elif order_currency == "USD" and fx_rate_usd_to_eur:
+            pending_value_eur += value * fx_rate_usd_to_eur
+        elif order_currency == "USD":
+            pending_value_eur += value / 1.05
+
+    return pending_value_eur, pending_orders
+
+
+def compute_budget_safe(total_cash, available_funds, pending_value_eur):
+    """Compute a conservative EUR budget and subtract pending BUY orders."""
+    budget_safe = 0.0
+    if total_cash is not None and total_cash > 0:
+        if available_funds is not None and available_funds > 0:
+            budget_safe = min(total_cash, available_funds)
+        else:
+            budget_safe = total_cash
+    elif available_funds is not None and available_funds > 0:
+        if total_cash is None or total_cash >= 0:
+            budget_safe = available_funds
+        else:
+            budget_safe = 0.0
+
+    return max(0.0, budget_safe - pending_value_eur)
+
+
+def main():
+    load_dotenv(".env")
+    args = build_arg_parser().parse_args()
 
     try:
-        from ib_insync import IB, Forex
+        from ib_insync import IB
     except Exception:
         print("Missing ib_insync. Install with: pip install ib_insync", file=sys.stderr)
         return 2
@@ -122,15 +256,11 @@ def main():
     ib = IB()
     ib.connect(args.host, args.port, clientId=args.client_id)
 
-    account = args.account
-    if not account:
-        accounts = ib.managedAccounts()
-        if len(accounts) == 1:
-            account = accounts[0]
-        elif accounts:
-            print("Multiple accounts found, use --account.", file=sys.stderr)
-            ib.disconnect()
-            return 2
+    account, account_error = resolve_ibkr_account(ib, args.account)
+    if account_error:
+        print(account_error, file=sys.stderr)
+        ib.disconnect()
+        return 2
 
     summary = read_account_summary(ib, account)
     budget_entry = select_budget(summary, args.budget_tag, args.budget_currency)
@@ -161,47 +291,13 @@ def main():
 
     ib.sleep(args.wait)
     portfolio_items = ib.portfolio()
-
     if not portfolio_items:
         print(
             "Warning: Portfolio is empty. Increase --wait if you have positions.",
             file=sys.stderr,
         )
 
-    positions = []
-    has_short_positions = False
-    for item in portfolio_items:
-        if account and item.account != account:
-            continue
-        contract = item.contract
-
-        # Calculer le pourcentage P&L
-        avg_cost = to_number(item.averageCost)
-        market_price = to_number(item.marketPrice)
-        pnl_percent = calculate_pnl_percent(market_price, avg_cost)
-
-        position_qty = to_number(item.position)
-        if position_qty is not None and position_qty < 0:
-            has_short_positions = True
-
-        positions.append(
-            {
-                "account": item.account,
-                "conid": contract.conId,
-                "symbol": contract.symbol,
-                "local_symbol": contract.localSymbol,
-                "security_type": contract.secType,
-                "exchange": contract.exchange,
-                "currency": contract.currency,
-                "position": position_qty,
-                "avg_cost": avg_cost,
-                "market_price": market_price,
-                "market_value": to_number(item.marketValue),
-                "unrealized_pnl": to_number(item.unrealizedPNL),
-                "realized_pnl": to_number(item.realizedPNL),
-                "pnl_percent": pnl_percent,
-            }
-        )
+    positions, has_short_positions = collect_positions(portfolio_items, account)
 
     # Alerter si positions short détectées
     if has_short_positions:
@@ -214,109 +310,24 @@ def main():
             file=sys.stderr,
         )
 
-    # Récupérer le taux de change EUR/USD implicite utilisé par IBKR
-    # en comparant les valeurs CashBalance en EUR et USD
-    fx_rate_usd_to_eur = None
-    cash_usd = get_account_value(summary, "CashBalance", "USD")
-    cash_eur_from_usd = get_account_value(summary, "CashBalance", "EUR")
-
-    # Si on a des valeurs EUR et USD, calculer le taux implicite
-    if cash_usd and cash_usd != 0 and cash_eur_from_usd and cash_eur_from_usd != 0:
-        # Le taux est approximé par la proportion des cash balances
-        # Note: Ceci est une approximation car CashBalance peut inclure plusieurs devises
-        fx_rate_usd_to_eur = cash_eur_from_usd / cash_usd if cash_usd != 0 else None
-
-    # Récupérer les ordres en attente (submitted mais pas filled)
-    open_trades = ib.openTrades()
-    pending_value_eur = 0.0
-    pending_value_by_currency = {}
-    pending_orders = []  # Liste détaillée des ordres pour Grok
-
-    for trade in open_trades:
-        order_status = trade.orderStatus.status
-        # Statuts considérés comme "en attente" (pas encore remplis)
-        pending_statuses = ['PreSubmitted', 'Submitted', 'PendingSubmit', 'PendingCancel']
-
-        if order_status in pending_statuses:
-            # Calculer la valeur estimée de l'ordre en attente
-            quantity = trade.order.totalQuantity
-            contract = trade.contract
-            action = trade.order.action
-
-            # Essayer d'obtenir le prix de l'ordre (limit price ou market price)
-            if hasattr(trade.order, 'lmtPrice') and trade.order.lmtPrice:
-                price = trade.order.lmtPrice
-            else:
-                # Si pas de limit price, récupérer le market price actuel
-                ib.qualifyContracts(contract)
-                ticker = ib.reqMktData(contract)
-                ib.sleep(1.0)
-                price = ticker.marketPrice() if ticker.marketPrice() else ticker.last
-                ib.cancelMktData(contract)
-
-            # Ajouter à la liste détaillée pour Grok
-            pending_orders.append({
-                "symbol": contract.symbol,
-                "action": action,
-                "quantity": int(quantity),
-                "status": order_status,
-                "limit_price": to_number(trade.order.lmtPrice) if hasattr(trade.order, 'lmtPrice') else None,
-                "order_type": trade.order.orderType,
-                "currency": contract.currency
-            })
-
-            # Calculer la valeur pour le budget (uniquement BUY)
-            if action == 'BUY' and price and price > 0:
-                order_value = quantity * price
-                order_currency = contract.currency
-
-                # Accumuler par devise
-                if order_currency not in pending_value_by_currency:
-                    pending_value_by_currency[order_currency] = 0.0
-                pending_value_by_currency[order_currency] += order_value
-
-    # Convertir les ordres en attente vers EUR
-    for order_currency, value in pending_value_by_currency.items():
-        if order_currency == currency:  # currency = EUR (budget_currency)
-            pending_value_eur += value
-        elif order_currency == 'USD' and fx_rate_usd_to_eur:
-            # Utiliser le taux implicite IBKR
-            pending_value_eur += value * fx_rate_usd_to_eur
-        elif order_currency == 'USD':
-            # Fallback: approximation standard si pas de taux disponible
-            pending_value_eur += value / 1.05
-        # Ajouter d'autres devises si nécessaire
+    fx_rate_usd_to_eur = compute_fx_rate_usd_to_eur(summary)
+    pending_value_eur, pending_orders = collect_pending_orders(
+        ib,
+        currency=currency,
+        fx_rate_usd_to_eur=fx_rate_usd_to_eur,
+    )
 
     if pending_value_eur > 0:
         print(f"INFO: Ordres en attente detectes - Valeur totale: {pending_value_eur:.2f} EUR", file=sys.stderr)
 
-    # Calculer le budget safe (le plus conservateur entre TotalCash et AvailableFunds)
-    # PUIS soustraire la valeur des ordres en attente
-    # Si TotalCash est négatif, on est en marge - budget = 0
-    # Sinon, on prend le minimum entre TotalCash et AvailableFunds
-    budget_safe = 0.0
-    if total_cash is not None and total_cash > 0:
-        if available_funds is not None and available_funds > 0:
-            budget_safe = min(total_cash, available_funds)
-        else:
-            budget_safe = total_cash
-    elif available_funds is not None and available_funds > 0:
-        # Cas où total_cash est négatif ou None mais AvailableFunds est positif
-        # On reste conservateur et on met budget à 0 si cash négatif
-        if total_cash is None or total_cash >= 0:
-            budget_safe = available_funds
-        else:
-            budget_safe = 0.0
-
-    # Soustraire la valeur des ordres en attente du budget safe
-    budget_safe = max(0.0, budget_safe - pending_value_eur)
+    budget_safe = compute_budget_safe(total_cash, available_funds, pending_value_eur)
 
     if pending_value_eur > 0:
         print(f"INFO: Budget ajuste - Budget safe apres ordres en attente: {budget_safe:.2f} EUR", file=sys.stderr)
 
     output = {
         "account": account or "",
-        "as_of": iso_utc_now(),
+        "as_of": utc_now_iso(),
         "net_liquidation": net_liquidation,  # NAV - Valeur totale du compte
         "total_cash": total_cash,  # Cash disponible (peut être négatif si marge)
         "available_funds": available_funds,  # Fonds disponibles pour trader
