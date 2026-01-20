@@ -427,12 +427,11 @@ def validate_instrument(spec):
             f"exchange {exchange} not allowed. Use SMART or leave empty for SMART routing."
         )
 
-    # Europe-only safety: avoid USD instruments (typically US listings).
-    # If you want multi-currency Europe (CHF/GBP/etc), keep those currencies.
+    # Europe-only + EUR-only safety: avoid FX and accidental US listings.
     currency = normalize_text(spec.get("currency"))
-    if currency == "USD":
+    if currency != "EUR":
         raise ValueError(
-            "USD instruments are blocked (Europe-only mode). Use an EU listing/currency."
+            f"Currency {currency or 'UNKNOWN'} is blocked (Europe EUR-only mode). Use EUR."
         )
 
     # ETF: blocage explicite des tickers US non-UCITS

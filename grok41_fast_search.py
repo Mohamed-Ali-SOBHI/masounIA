@@ -437,7 +437,7 @@ def main():
         CONTRACT RULES: security_type in {ALLOWED_SEC_TYPES}, exchange=SMART only (or empty -> SMART). LIMIT only.
         PRIMARY EXCHANGE: Provide primary_exchange for European stocks to avoid ambiguous tickers (examples: SBF=Paris, AEB=Amsterdam, IBIS=Xetra, LSE=London, SWX=Swiss, BVME=Milan).
         BUDGET RULE: Total BUY <= {budget_max:.2f} EUR (80% budget). If exceeded, keep order but add warning.
-        EUROPE ONLY: Trade European listings only. Currency MUST NOT be USD (use EUR/GBP/CHF/etc). Do NOT propose US tickers.
+        EUROPE ONLY: Trade European listings only. Currency MUST be EUR. Do NOT propose US tickers.
         IBKR: ETFs=UCITS only (no SPY/QQQ). Stocks=Europe only. Use base ticker (no .PA/.AS), set primary_exchange.
 
         ==== OUTPUT ====
