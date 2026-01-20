@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
+"""Audit memory.
+
+The goal of this module is to provide Grok with *useful continuity* (recent
+reasoning, attempted orders, errors) without blowing up token usage.
+
+Key idea:
+- keep full details in audit files (free)
+- send a compact, structured memory snippet to the LLM (paid)
 """
-Module pour extraire et formatter la memoire des audits recents.
-Permet au bot de se souvenir de ses decisions passees et d'apprendre de ses erreurs.
-"""
+
+from __future__ import annotations
+
 import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 
 def get_recent_audits(audit_dir: str = "audit", lookback_hours: int = 72) -> list[dict]:
@@ -91,184 +100,193 @@ def get_recent_audits(audit_dir: str = "audit", lookback_hours: int = 72) -> lis
     return audits
 
 
-def extract_memory_context(audits: list[dict], max_tokens: int = 500) -> str:
-    """
-    Extraire et formatter un contexte memoire concis depuis les audits recents.
+def _short(text: str, max_len: int) -> str:
+    value = (text or "").strip().replace("\n", " ")
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 1].rstrip() + "…"
 
-    Args:
-        audits: Liste de dicts audit depuis get_recent_audits()
-        max_tokens: Budget approximatif de tokens (defaut: 500)
 
-    Returns:
-        String formatee en francais, prete pour injection dans le prompt
+def _parse_error_code(text: str) -> str | None:
+    # Common IBKR format: "Error 201, reqId ..."
+    if not text:
+        return None
+    idx = text.find("Error")
+    if idx < 0:
+        return None
+    tail = text[idx:].split()
+    if len(tail) < 2:
+        return None
+    candidate = tail[1].strip(",").strip(":")
+    return candidate if candidate.isdigit() else None
+
+
+def _domain(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower().strip()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
+
+
+def extract_full_compact_memory_context(audits: list[dict]) -> str:
+    """Return full 48h memory, compacted (no URLs).
+
+    This preserves all runs within the lookback window and all fields that
+    matter for continuity:
+    - what was proposed (orders)
+    - why (summary + key_points)
+    - what failed (errors)
+    - what sources were cited (titles + domains, without URLs)
+
+    URLs are intentionally omitted to save tokens. Grok can retrieve them again
+    via web_search using the title and/or the domain.
     """
     if not audits:
         return ""
 
-    # Limiter au max 6 audits les plus recents
-    audits = audits[-6:]
+    def format_place_error(audit_data: dict) -> str | None:
+        place = audit_data.get("place") or {}
+        stderr = str(place.get("stderr", "") or "").strip()
+        if not stderr:
+            return None
+        first_line = stderr.split("\n", 1)[0].strip()
+        if not first_line:
+            return None
 
-    lines = ["HISTORIQUE RECENT (dernieres 72h):", ""]
+        code = _parse_error_code(first_line)
+        if not code:
+            return first_line
 
-    for audit in audits:
-        run_id = audit['run_id']
-        audit_data = audit['audit_data']
-        orders_data = audit['orders_data']
+        reason = first_line
+        if ":" in reason:
+            reason = reason.split(":", 1)[1].strip()
+        reason_upper = reason.upper()
+        if "MINIMUM DE 2000" in reason_upper or "MINIMUM 2000" in reason_upper:
+            reason = "minimum 2000 EUR requis (marge/FX/short)"
+        return f"IBKR#{code}: {reason}"
 
-        # Parser timestamp (format: YYYYMMDD_HHMMSS)
-        try:
-            dt = datetime.strptime(run_id, "%Y%m%d_%H%M%S")
-            timestamp_str = dt.strftime("%d/%m %H:%M")
-        except ValueError:
-            timestamp_str = run_id[:13]  # Fallback
+    def collect_sources(orders_data: dict) -> list[str]:
+        refs: list[str] = []
 
-        # Status et erreurs d'execution
-        status = audit_data.get('status', 'unknown')
-        error = audit_data.get('error')
-        place_data = audit_data.get('place', {})
-        place_stderr = place_data.get('stderr', '')
-        has_execution_error = place_stderr and ('Error' in place_stderr or 'Cancelled' in place_stderr)
-
-        if status == 'error' or error or has_execution_error:
-            # RUN FAILED
-            lines.append(f"[{timestamp_str}] RUN FAILED")
-
-            # Extraire erreur d'execution depuis place.stderr si disponible
-            if place_stderr:
-                # Parser les erreurs IBKR
-                if 'Error 10311' in place_stderr:
-                    # Erreur routing direct - extraire symboles
-                    symbols = []
-                    for line in place_stderr.split('\n'):
-                        if 'symbol=' in line and 'exchange=' in line:
-                            # Extraire symbol et exchange
-                            try:
-                                sym_start = line.index("symbol='") + 8
-                                sym_end = line.index("'", sym_start)
-                                symbol = line[sym_start:sym_end]
-                                exch_start = line.index("exchange='") + 10
-                                exch_end = line.index("'", exch_start)
-                                exchange = line[exch_start:exch_end]
-                                symbols.append(f"{symbol} (exchange={exchange})")
-                            except:
-                                pass
-                    if symbols:
-                        lines.append(f"- Erreur 10311: Direct routing interdit - {', '.join(symbols)}")
-                        lines.append(f"- Solution: Utiliser exchange=SMART au lieu de NASDAQ/NYSE")
-                    else:
-                        lines.append(f"- Erreur 10311: Direct routing (NASDAQ/NYSE) interdit, utiliser SMART")
-                else:
-                    # Autre erreur - premier ligne
-                    error_lines = place_stderr.strip().split('\n')
-                    if error_lines:
-                        error_msg = error_lines[0][:100]  # Truncate
-                        lines.append(f"- Erreur execution: {error_msg}")
-            elif error:
-                lines.append(f"- Erreur: {error}")
-
-            # Si orders.json existe, montrer ce qui etait propose
-            if orders_data and 'orders' in orders_data:
-                orders = orders_data['orders']
-                if orders:
-                    order = orders[0]  # Premier ordre seulement
-                    symbol = order.get('symbol', '?')
-                    action = order.get('action', '?')
-                    qty = order.get('quantity', 0)
-                    price = order.get('limit_price', 0)
-                    rationale = order.get('rationale', '')[:50]  # Truncate
-                    lines.append(f"- Ordre propose: {action} {qty} {symbol} @ {price} ({rationale})")
-
-            lines.append("")
-
-        else:
-            # RUN OK
-            if not orders_data:
-                lines.append(f"[{timestamp_str}] OK - Pas de donnees")
-                lines.append("")
-                continue
-
-            # Budget utilise
-            budget_eur = orders_data.get('budget_eur', 0)
-            estimated = orders_data.get('estimated_total_eur', 0)
-            if budget_eur > 0:
-                pct = int((estimated / budget_eur) * 100)
-                # Formater montants (k = milliers)
-                if estimated >= 1000:
-                    est_str = f"{int(estimated/1000)}k"
-                else:
-                    est_str = f"{int(estimated)}"
-                if budget_eur >= 1000:
-                    budget_str = f"{int(budget_eur/1000)}k"
-                else:
-                    budget_str = f"{int(budget_eur)}"
-                lines.append(f"[{timestamp_str}] OK - Budget: {est_str} / {budget_str} EUR ({pct}%)")
+        def add(url: str | None, title: str | None, publish_date: str | None = None):
+            dom = _domain(url or "")
+            t = (title or "").strip()
+            if dom and t:
+                item = f"{dom} | {t}"
+            elif t:
+                item = t
+            elif dom:
+                item = dom
             else:
-                lines.append(f"[{timestamp_str}] OK")
+                return
+            if publish_date:
+                item = f"{item} ({publish_date})"
+            if item not in refs:
+                refs.append(item)
 
-            # Summary (truncate)
-            summary = orders_data.get('summary', '')[:100]
-            if summary:
-                lines.append(f"- Strategie: {summary}")
+        # Legacy sources
+        sources = orders_data.get("sources")
+        if isinstance(sources, list):
+            for s in sources:
+                if isinstance(s, dict):
+                    add(s.get("url"), s.get("title"), s.get("publish_date"))
 
-            # Key points (premiers 2 seulement)
-            key_points = orders_data.get('key_points', [])
-            if key_points:
-                # Extraire catalyseurs si present
-                for kp in key_points[:2]:
-                    if 'Catalyseur' in kp or 'catalyseur' in kp:
-                        lines.append(f"- {kp[:80]}")
-                        break
+        macro = orders_data.get("macro_sources")
+        if isinstance(macro, list):
+            for s in macro:
+                if isinstance(s, dict):
+                    add(s.get("url"), s.get("title"), s.get("publish_date"))
 
-            # Orders (lister symboles)
-            orders = orders_data.get('orders', [])
-            if orders:
-                order_strs = []
-                for order in orders[:3]:  # Max 3 orders
-                    symbol = order.get('symbol', '?')
-                    action = order.get('action', '?')
-                    qty = order.get('quantity', 0)
-                    price = order.get('limit_price', 0)
-                    order_strs.append(f"{action} {int(qty)} {symbol} @ {price}")
-                lines.append(f"- Ordres: {', '.join(order_strs)}")
-            else:
-                lines.append("- Aucun ordre (pas de catalyseurs)")
+        orders = orders_data.get("orders")
+        if isinstance(orders, list):
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                for s in o.get("dedicated_sources") or []:
+                    if isinstance(s, dict):
+                        add(s.get("url"), s.get("title"), s.get("publish_date"))
 
-            lines.append("")
+        return refs
 
-    # Joindre
-    result = "\n".join(lines)
+    audits_sorted = sorted(audits, key=lambda a: a.get("timestamp") or datetime.now(timezone.utc))
 
-    # Verifier taille approximative (1 token ~= 4 chars)
-    approx_tokens = len(result) / 4
+    lines: list[str] = []
+    lines.append("MEMOIRE 48H (full, compact, sans URLs):")
+    lines.append(
+        "Instruction: conserve la coherence sur 48h, evite de repeter les memes idees/erreurs. Les URLs ne sont pas incluses; refais web_search si besoin."
+    )
 
-    # Si depasse budget, drop oldest audit iterativement
-    while approx_tokens > max_tokens and len(audits) > 1:
-        audits = audits[1:]  # Drop oldest
-        # Reconstruire (recursion simple)
-        return extract_memory_context(audits, max_tokens)
+    for audit in reversed(audits_sorted):
+        run_id = audit.get("run_id") or ""
+        ts = audit.get("timestamp") or datetime.now(timezone.utc)
+        audit_data = audit.get("audit_data") or {}
+        orders_data = audit.get("orders_data") or {}
 
-    # Ajouter instruction finale
-    result += "\n---\nUtilise cet historique pour eviter erreurs repetees et continuer strategie coherente.\n"
+        status = str(audit_data.get("status", "unknown")).upper()
+        ts_str = ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
 
-    return result
+        err_parts: list[str] = []
+        if audit_data.get("error"):
+            err_parts.append(str(audit_data.get("error")))
+        place_err = format_place_error(audit_data)
+        if place_err:
+            err_parts.append(place_err)
+        err_str = " | ".join(err_parts) if err_parts else "-"
 
+        orders = orders_data.get("orders") if isinstance(orders_data, dict) else None
+        order_count = len(orders) if isinstance(orders, list) else 0
+        lines.append(f"[{ts_str}] run={run_id} status={status} orders={order_count} err={err_str}")
 
+        if isinstance(orders_data, dict) and orders_data.get("summary"):
+            lines.append("  summary=" + str(orders_data.get("summary")))
+
+        key_points = orders_data.get("key_points") if isinstance(orders_data, dict) else None
+        if isinstance(key_points, list) and key_points:
+            lines.append("  key_points=" + " | ".join(str(k) for k in key_points))
+
+        if isinstance(orders, list) and orders:
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                action = o.get("action")
+                symbol = o.get("symbol")
+                qty = o.get("quantity")
+                lp = o.get("limit_price")
+                prim = o.get("primary_exchange")
+                conf = o.get("confidence_score")
+                src_count = o.get("source_count")
+                timing = o.get("catalyst_timing") or {}
+                cat = timing.get("catalyst_description") if isinstance(timing, dict) else None
+                cat_dt = timing.get("catalyst_datetime") if isinstance(timing, dict) else None
+                t_hours = timing.get("time_to_catalyst_hours") if isinstance(timing, dict) else None
+                lines.append(
+                    "  order="
+                    + f"{action} {qty} {symbol} @ {lp} EUR"
+                    + (f" prim={prim}" if prim else "")
+                    + (f" T={t_hours}h" if t_hours is not None else "")
+                    + (f" cat={cat}" if cat else "")
+                    + (f" cat_dt={cat_dt}" if cat_dt else "")
+                    + (f" conf={conf}" if conf is not None else "")
+                    + (f" src={src_count}" if src_count is not None else "")
+                )
+
+        sources = collect_sources(orders_data) if isinstance(orders_data, dict) else []
+        if sources:
+            lines.append("  sources_cited=" + " || ".join(sources))
+
+    return "\n".join(lines)
 def build_memory_section(audit_dir: str = "audit", lookback_hours: int = 72) -> str:
-    """
-    Fonction de haut niveau qui combine get_recent_audits + extract_memory_context.
+    """Build full compact memory for the LLM (no URLs, no truncation/caps).
 
-    Args:
-        audit_dir: Chemin vers le repertoire audit
-        lookback_hours: Periode de lookback en heures
-
-    Returns:
-        String formatee pour injection dans le prompt, ou "" si aucun audit
+    Note: Details live in audit files; this returns a compact rendering that is
+    stable across runs.
     """
     try:
         audits = get_recent_audits(audit_dir, lookback_hours)
-        if not audits:
-            return ""
-        return extract_memory_context(audits)
+        return extract_full_compact_memory_context(audits)
     except Exception as e:
         print(f"Warning: Failed to build memory context: {e}", file=sys.stderr)
         return ""

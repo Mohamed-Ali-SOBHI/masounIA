@@ -77,6 +77,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dump-messages",
         help="Write the model messages payload to a JSON file.",
     )
+    parser.add_argument(
+        "--dump-only",
+        action="store_true",
+        help="Write --dump-messages and exit (no API call).",
+    )
+    parser.add_argument(
+        "--print-prompt",
+        action="store_true",
+        help="Print the system prompt to stdout.",
+    )
     return parser
 
 
@@ -114,6 +124,77 @@ def load_positions(path):
     if isinstance(positions, dict):
         pending_orders = positions.get("pending_orders", [])
     return positions, pending_orders
+
+
+def build_llm_positions_payload(positions):
+    """Reduce positions JSON size for LLM usage.
+
+    Full details stay in audit/positions.json; the LLM only needs the fields
+    required for decisions.
+    """
+    if not isinstance(positions, dict):
+        return positions
+
+    out = {
+        "account": positions.get("account"),
+        "as_of": positions.get("as_of"),
+        "net_liquidation": positions.get("net_liquidation"),
+        "total_cash": positions.get("total_cash"),
+        "available_funds": positions.get("available_funds"),
+        "pending_orders_value": positions.get("pending_orders_value"),
+        "budget_safe": positions.get("budget_safe"),
+        "using_margin": positions.get("using_margin"),
+        "currency": positions.get("currency"),
+        "budget_eur": positions.get("budget_eur"),
+        "budget_currency": positions.get("budget_currency"),
+        "budget_tag": positions.get("budget_tag"),
+        "positions": [],
+    }
+
+    pos_list = positions.get("positions", [])
+    if isinstance(pos_list, list):
+        for p in pos_list:
+            if not isinstance(p, dict):
+                continue
+            out["positions"].append(
+                {
+                    "symbol": p.get("symbol"),
+                    "security_type": p.get("security_type"),
+                    "exchange": p.get("exchange"),
+                    "primary_exchange": p.get("primary_exchange"),
+                    "currency": p.get("currency"),
+                    "position": p.get("position"),
+                    "avg_cost": p.get("avg_cost"),
+                    "market_price": p.get("market_price"),
+                    "unrealized_pnl": p.get("unrealized_pnl"),
+                    "pnl_percent": p.get("pnl_percent"),
+                }
+            )
+
+    return out
+
+
+def build_llm_pending_orders_payload(pending_orders):
+    if not isinstance(pending_orders, list):
+        return pending_orders
+    out = []
+    for o in pending_orders:
+        if not isinstance(o, dict):
+            continue
+        out.append(
+            {
+                "symbol": o.get("symbol"),
+                "action": o.get("action"),
+                "quantity": o.get("quantity"),
+                "status": o.get("status"),
+                "limit_price": o.get("limit_price"),
+                "order_type": o.get("order_type"),
+                "currency": o.get("currency"),
+                "exchange": o.get("exchange"),
+                "primary_exchange": o.get("primary_exchange"),
+            }
+        )
+    return out
 
 
 def validate_positions_or_exit(positions):
@@ -223,8 +304,11 @@ def main():
     query = args.query or DEFAULT_QUERY
 
     positions, pending_orders = load_positions(args.positions)
-    positions_json = json.dumps(positions, ensure_ascii=True)
-    pending_orders_json = json.dumps(pending_orders, ensure_ascii=True)
+    positions_json = json.dumps(build_llm_positions_payload(positions), ensure_ascii=True)
+    pending_orders_json = json.dumps(
+        build_llm_pending_orders_payload(pending_orders),
+        ensure_ascii=True,
+    )
 
     try:
         _using_margin, total_cash, margin_call_mode = validate_positions_or_exit(positions)
@@ -246,10 +330,10 @@ def main():
 
     markets_context = build_markets_context(current_time)
 
-    # Build memory context from recent audits
+    # Build memory context from recent audits (compact to save tokens).
     memory_context = build_memory_section(
         audit_dir=os.getenv("IBKR_AUDIT_DIR", "audit"),
-        lookback_hours=72
+        lookback_hours=int(os.getenv("IBKR_MEMORY_LOOKBACK_HOURS", "48")),
     )
 
     try:
@@ -375,7 +459,8 @@ def main():
 
             return orders
 
-    schema_json = OrderPlan.model_json_schema()
+    # NOTE: do NOT embed the JSON schema in the prompt (too expensive). The
+    # SDK already constrains the output via response_format=OrderPlan.
 
     # Build margin status context
     margin_status = ""
@@ -446,7 +531,7 @@ def main():
         2) HYPE RADAR + LEADING INDICATORS:
         - Primary window: 0-24h (fresh). Secondary: 24-72h ONLY if there is a NEW update.
         - Look for: product launch/teaser, major contract, partnership, regulatory decision, trading update, guidance raise, earnings pre-positioning.
-        - Per instrument: 7-10+ sources (>=1 official IR/press release, >=2 market data, >=1 analyst, >=1 sentiment).
+        - Per instrument: consult 7-10+ sources (>=1 official IR/press release, >=2 market data, >=1 analyst, >=1 sentiment).
         - Anti-chase: If the trigger is old and already widely covered, do NOT buy.
 
         3) TIMING: T = hours to catalyst. catalyst_datetime ISO required.
@@ -475,7 +560,12 @@ def main():
 
         Each order: symbol, action (BUY/SELL), quantity, limit_price, currency, exchange, primary_exchange, rationale.
         catalyst_timing: {{catalyst_description, catalyst_datetime (ISO), time_to_catalyst_hours (BUY +[2,48], SELL can be -), entry_timing_rationale, timing_risk_level}}
-        confidence_score: 70-100. source_count: >=7. dedicated_sources: [{{title, url, category, relevance, publish_date}}]
+        SOURCES POLICY (cost control):
+        - source_count MUST reflect the total number of sources you actually checked (>=7).
+        - dedicated_sources MUST include only the TOP 2-3 most relevant sources (prefer 1 official + 1 market data + optionally 1 analyst).
+        - macro_sources MUST include max 1-2 sources.
+        - sources (legacy) MUST include max 3 items.
+        confidence_score: 70-100. source_count: >=7. dedicated_sources (2-3 max): [{{title, url, category, relevance, publish_date}}]
         warnings: list of rule deviations (e.g., budget >80%, exchange!=SMART, security_type not allowed, SELL>position-pending, BUY blocked by margin). Do not drop the order; just declare the warnings.
 
         OrderPlan: summary (FR), key_points (FR), budget_eur={budget_eur:.2f}, estimated_total_eur, orders[], sources[], macro_sources[], disclaimer (FR).
@@ -484,7 +574,7 @@ def main():
         - Analyzed ALL positions? - SELL if Priority 1/2? - Each order 7+ sources? - Exact catalyst_datetime?
         - BUY: T in [2,48]h? SELL: T justified? - Confidence >=70 (>=80 edge)? - Total <= {budget_max:.2f}? - No repeats?
 
-        Schema: {json.dumps(schema_json, indent=2, ensure_ascii=True)}
+        OUTPUT FORMAT: return JSON that validates against the OrderPlan schema (no extra fields).
         """
     )
 
@@ -505,6 +595,11 @@ def main():
     }
     if args.dump_messages:
         write_json(messages_payload, args.dump_messages)
+
+    if args.dump_only:
+        if args.print_prompt:
+            print(system_prompt)
+        return 0
 
     client = Client(api_key=api_key, timeout=args.timeout)
     chat = client.chat.create(
