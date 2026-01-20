@@ -80,8 +80,8 @@ def _sleep_until(target_utc: datetime):
 def main():
     load_dotenv(".env")
 
-    start_h, start_m = _parse_hhmm(os.getenv("EU_SESSION_START", "08:45"), (8, 45))
-    end_h, end_m = _parse_hhmm(os.getenv("EU_SESSION_END", "17:45"), (17, 45))
+    start_h, start_m = _parse_hhmm(os.getenv("EU_SESSION_START", "08:35"), (8, 35))
+    end_h, end_m = _parse_hhmm(os.getenv("EU_SESSION_END", "17:40"), (17, 40))
     interval_min = int(os.getenv("EU_RUN_INTERVAL_MIN", "60"))
 
     script_dir = os.path.dirname(os.path.abspath(__file__))

@@ -11,6 +11,7 @@ import os
 import sys
 import textwrap
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from audit_memory import build_memory_section
 from ibkr_shared import (
@@ -23,8 +24,14 @@ from ibkr_shared import (
 # Instruments autorises pour la generation d'ordres (coherent avec l'execution IBKR)
 ALLOWED_SEC_TYPES = ["STK", "ETF"]
 
+EU_TZ = ZoneInfo("Europe/Paris")
+
+
 DEFAULT_QUERY = (
-    "Analyse les news des dernieres 48-72h et propose des trades bases sur les catalyseurs actuels."
+    "Zone euro uniquement (actions/ETF en EUR). Objectif: capter le debut de vague (hype) et les annonces positives avant qu'elles soient price-in. "
+    "Priorite: news tres fraiches (0-24h) + evenements imminents (1-7 jours: trading update, guidance, earnings, lancement produit, gros contrat, decision reglementaire). "
+    "Anti-chase: eviter d'acheter si la news est deja vieille et que le move principal est probablement deja fait. "
+    "Retourner orders=[] si rien de solide."
 )
 
 
@@ -229,6 +236,13 @@ def main():
         return 2
 
     current_time = datetime.now(timezone.utc)
+    current_time_eu = current_time.astimezone(EU_TZ)
+    if current_time_eu.hour < 9:
+        run_mode = "PREOPEN"
+    elif current_time_eu.hour < 17:
+        run_mode = "INTRADAY"
+    else:
+        run_mode = "POSTCLOSE"
 
     markets_context = build_markets_context(current_time)
 
@@ -395,14 +409,22 @@ def main():
     # Calculate budget limits
     budget_max = budget_eur * 0.80  # 80% pour sécurité
 
-    # Build NEW system prompt (refonte complete pour timing precis)
+    # Build system prompt.
     current_time_iso = current_time.isoformat()
+    current_time_eu_iso = current_time_eu.isoformat()
 
     system_prompt = textwrap.dedent(
         f"""\
-        Event catalyst analyst. IBKR. Time: {current_time_iso}. {markets_context}
+        Event catalyst analyst. IBKR.
+        Time UTC: {current_time_iso}
+        Time Europe/Paris: {current_time_eu_iso}
+        MODE: {run_mode} (bot runs hourly during Europe session only)
+        Market gate: {markets_context}
 
-        CONTEXT: Bot runs hourly. High-conviction only. No catalysts? orders=[].
+        CONTEXT: High-conviction only. No solid trigger? orders=[].
+        SESSION BEHAVIOR:
+        - PREOPEN: focus on fresh overnight announcements, morning PRs, and catalysts within 1-7 days.
+        - INTRADAY: focus on new headlines since last run (last 1-2h) and intraday momentum drivers.
         BUDGET: {budget_eur:.2f} EUR | Max {budget_max:.2f} EUR (80%). Sum(BUY * limit_price) <= max.
         {margin_status}
         {memory_context if memory_context else ""}
@@ -419,26 +441,35 @@ def main():
         - Position has >N shares -> Can SELL max (position - N)
         If BUY pending -> budget already reduced, ignore for position calc.
 
-        1) MACRO: web_search Fed/ECB/geopolitics/VIX. 2-3 sources -> macro_sources.
+        1) MACRO (light): Only if clearly impacting Europe today. 1-2 sources -> macro_sources.
 
-        2) CATALYSTS (24-48h only): earnings/FDA/M&A/partnerships. Per instrument 7-10+ sources (2-3 official, 2-3 market data, 1-2 analyst, 1-2 sentiment, 1 macro).
+        2) HYPE RADAR + LEADING INDICATORS:
+        - Primary window: 0-24h (fresh). Secondary: 24-72h ONLY if there is a NEW update.
+        - Look for: product launch/teaser, major contract, partnership, regulatory decision, trading update, guidance raise, earnings pre-positioning.
+        - Per instrument: 7-10+ sources (>=1 official IR/press release, >=2 market data, >=1 analyst, >=1 sentiment).
+        - Anti-chase: If the trigger is old and already widely covered, do NOT buy.
 
         3) TIMING: T = hours to catalyst. catalyst_datetime ISO required.
-        BUY: T in [2,12]h conf>=80 | T in (12,36)h conf>=70 | T in [36,48]h conf>=80. REJECT T<2h or T>48h.
+        BUY: prefer T in [2,72]h (sweet spot 6-36h). Allow up to 7 days ONLY for very strong setups.
+        REJECT buying "after the wave" (late entry). If news >24h and no new info: do NOT buy.
         SELL: allow negative T (post-catalyst) or immediate if justified.
 
         4) CONFIDENCE (0-100): Base: 7src=70, 10src=80. Bonus: optimal window +10, major FDA +10, volume spike +5. Penalty: biotech -5. Min 70.
 
         ==== SELECTION ====
 
-        NEW POSITIONS: Max 3-5 liquid (vol>500K/d), 2/sector, LONG only, LIMIT orders, DAY/GTC, SMART exchange.
+        NEW POSITIONS: Max 3-5 liquid Europe listings, 2/sector, LONG only, LIMIT orders, DAY/GTC, SMART exchange.
         NO REPEAT: Skip symbols bought last 3 runs unless NEW catalyst.
         PENDING SELLS RULE: SELL qty <= position - pending_sells_qty (otherwise warning).
         CONTRACT RULES: security_type in {ALLOWED_SEC_TYPES}, exchange=SMART only (or empty -> SMART). LIMIT only.
-        PRIMARY EXCHANGE: Provide primary_exchange for European stocks to avoid ambiguous tickers (examples: SBF=Paris, AEB=Amsterdam, IBIS=Xetra, LSE=London, SWX=Swiss, BVME=Milan).
+        PRIMARY EXCHANGE: Required for stocks to avoid ambiguous tickers.
+        Use euro-zone exchanges (examples: SBF=Paris, AEB=Amsterdam, ENX=Brussels, IBIS=Xetra, BVME=Milan, BME=Madrid).
         BUDGET RULE: Total BUY <= {budget_max:.2f} EUR (80% budget). If exceeded, keep order but add warning.
-        EUROPE ONLY: Trade European listings only. Currency MUST be EUR. Do NOT propose US tickers.
-        IBKR: ETFs=UCITS only (no SPY/QQQ). Stocks=Europe only. Use base ticker (no .PA/.AS), set primary_exchange.
+        ZONE EURO ONLY: Trade EUR-denominated euro-zone listings only.
+        - currency MUST be EUR
+        - do NOT propose US/UK/CH tickers
+        - ETFs=UCITS only. Stocks=euro-zone only.
+        - Use base ticker (no .PA/.AS) and set primary_exchange.
 
         ==== OUTPUT ====
 

@@ -33,7 +33,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--query",
         default=(
-            "Analyse les news des dernieres 48-72h et propose des trades bases sur les catalyseurs actuels."
+            "Zone euro uniquement (actions/ETF en EUR). Objectif: capter le debut de vague (hype) et les annonces positives avant qu'elles soient price-in. "
+            "Priorite: news tres fraiches (0-24h) + evenements imminents (1-7 jours: trading update, guidance, earnings, lancement produit, gros contrat, decision reglementaire). "
+            "Anti-chase: eviter d'acheter si la news est deja vieille et que le move principal est probablement deja fait. "
+            "Retourner orders=[] si rien de solide."
         ),
         help="User task or question for Grok (default: analyze recent news).",
     )
@@ -379,7 +382,10 @@ def main():
             audit_payload["grok_output_parsed"] = parsed
             write_json(parsed, os.path.join(audit_dir, "orders.json"))
 
-        if args.check or args.submit:
+        orders_list = parsed.get("orders", []) if isinstance(parsed, dict) else []
+        has_orders = isinstance(orders_list, list) and len(orders_list) > 0
+
+        if (args.check or args.submit) and has_orders:
             enriched_out = (
                 os.path.join(audit_dir, "orders_enriched.json") if audit_dir else None
             )
@@ -403,7 +409,7 @@ def main():
                 if os.path.isfile(enriched_out):
                     audit_payload["orders_enriched"] = read_json(enriched_out)
 
-        orders_placed_count = len(parsed.get("orders", [])) if args.submit else None
+        orders_placed_count = len(orders_list) if (args.submit and has_orders) else None
         alert_execution_summary(
             parsed,
             positions_data,

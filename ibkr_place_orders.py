@@ -522,8 +522,9 @@ def main():
 
     orders = data.get("orders", [])
     if not isinstance(orders, list) or not orders:
+        # No-op is a valid outcome (Grok can return an empty plan).
         print("No orders found in JSON.", file=sys.stderr)
-        return 2
+        return 0
 
     try:
         validate_orders_input(orders, positions_list, pending_sells_map)
